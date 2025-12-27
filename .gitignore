@@ -1,0 +1,29 @@
+# Log files
+logs/
+*.log
+
+# Image files (too large for git)
+*.img
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+cursor-setup.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+polaris-succesfull-burn-*.txt
+

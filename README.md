@@ -165,42 +165,42 @@ The following diagram shows the complete state machine with all transitions and 
 stateDiagram-v2
     [*] --> INIT: Start
     
-    INIT --> BOOTROM: Pattern: bootrom/bl2 detected
-    INIT --> UBOOT: Pattern: uboot_version/uboot_prompt detected
-    INIT --> LOGIN: Pattern: login_prompt detected\nAction: Send "root"
-    INIT --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
-    INIT --> INIT: Pattern: bl2/bl31/bl32 after reboot\nAction: Start continuous Enter
+    INIT --> BOOTROM: bootrom/bl2 pattern
+    INIT --> UBOOT: uboot_version pattern
+    INIT --> LOGIN: login_prompt pattern
+    INIT --> INIT: shell_prompt pattern
+    INIT --> INIT: bl2 after reboot
     
-    BOOTROM --> UBOOT: Pattern: uboot_version detected
-    BOOTROM --> BOOTROM: Pattern: bl2/bl31/bl32 after reboot\nAction: Start continuous Enter
+    BOOTROM --> UBOOT: uboot_version pattern
+    BOOTROM --> BOOTROM: bl2 after reboot
     
-    UBOOT --> UBOOT: Pattern: autoboot detected\nAction: Send Enter immediately
-    UBOOT --> DOWNLOAD: Pattern: uboot_prompt detected\nAction: Send "adnl" command
-    UBOOT --> LOGIN: Pattern: login_prompt detected\nAction: Send "root"
-    UBOOT --> LINUX: Pattern: login_prompt detected\n(if login already sent)
-    UBOOT --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    UBOOT --> UBOOT: autoboot pattern
+    UBOOT --> DOWNLOAD: uboot_prompt pattern
+    UBOOT --> LOGIN: login_prompt pattern
+    UBOOT --> LINUX: login_prompt already sent
+    UBOOT --> INIT: shell_prompt pattern
     
-    DOWNLOAD --> DOWNLOAD: Pattern: usb_reset detected\n(USB download mode active)
-    DOWNLOAD --> DOWNLOAD: Pattern: rebooting detected\n(Expected after burn)
-    DOWNLOAD --> BOOT_VERIFY: adnl_burn_pkg successful\nAction: Reset flags
-    DOWNLOAD --> ERROR: adnl_burn_pkg failed\nImage file not found
+    DOWNLOAD --> DOWNLOAD: usb_reset pattern
+    DOWNLOAD --> DOWNLOAD: rebooting pattern
+    DOWNLOAD --> BOOT_VERIFY: burn successful
+    DOWNLOAD --> ERROR: burn failed
     
-    BOOT_VERIFY --> BOOT_VERIFY: Pattern: login_prompt detected\nAction: Send "root"
-    BOOT_VERIFY --> BOOT_VERIFY: Pattern: shell_prompt detected\nAction: Send "uname -a"
-    BOOT_VERIFY --> COMPLETE: Pattern: Kernel version detected\n(uname -a output)
-    BOOT_VERIFY --> COMPLETE: Timeout (30s)\n(With warning)
+    BOOT_VERIFY --> BOOT_VERIFY: login_prompt pattern
+    BOOT_VERIFY --> BOOT_VERIFY: shell_prompt pattern
+    BOOT_VERIFY --> COMPLETE: kernel version detected
+    BOOT_VERIFY --> COMPLETE: timeout
     
-    LINUX --> LOGIN: Pattern: login_prompt detected\nAction: Send "root"
-    LINUX --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    LINUX --> LOGIN: login_prompt pattern
+    LINUX --> INIT: shell_prompt pattern
     
-    LOGIN --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    LOGIN --> INIT: shell_prompt pattern
     
-    INIT --> ERROR: No serial data (20+ seconds)
-    INIT --> ERROR: Wake-up attempts failed\n(Relay-less mode)
-    INIT --> ERROR: Failed to catch autoboot\n(After 2 power cycles)
-    UBOOT --> ERROR: U-Boot prompt timeout\n(30s after reboot)
-    DOWNLOAD --> ERROR: adnl_burn_pkg error
-    [*] --> ERROR: Image validation failed\nSerial port error\nRelay error
+    INIT --> ERROR: no serial data
+    INIT --> ERROR: wake-up failed
+    INIT --> ERROR: autoboot missed
+    UBOOT --> ERROR: timeout
+    DOWNLOAD --> ERROR: burn error
+    [*] --> ERROR: validation error
     
     COMPLETE --> [*]: Success
     ERROR --> [*]: Failure

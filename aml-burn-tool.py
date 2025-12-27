@@ -333,6 +333,15 @@ class BurnTool:
     # Send carriage return
     self.serial_conn.write(b"\r")
     self.logger.debug(f"Sent command: {command}")
+  
+  def send_ctrl_c_enter(self):
+    """Send Ctrl+C followed by Enter to wake up board from adnl mode"""
+    if not self.serial_conn or not self.serial_conn.is_open:
+      return
+    self.serial_conn.write(b"\x03")  # Ctrl+C
+    time.sleep(0.1)
+    self.serial_conn.write(b"\r")  # Enter
+    time.sleep(0.1)
 
   async def send_continuous_enter(self):
     """Send Enter continuously (every 1ms) to catch autoboot"""
@@ -1012,18 +1021,68 @@ class BurnTool:
       self.logger.info("No relay configured, assuming board is already powered on")
       
       # Initial wait and wake-up sequence
+      # Board might be in adnl mode, so we need to try different wake-up methods
       self.logger.info("Waiting 3 seconds for initial boot/console wake-up...")
       await asyncio.sleep(3)
 
       # Check if we received any data
       if self.lines_received == 0:
         self.logger.info(
-          "No data received yet, sending Enter to wake up console..."
+          "No data received yet, trying to wake up console..."
         )
-        self.send_serial_command("")
-        self.initial_wake_sent = True
-        self.logger.info("Enter sent, waiting 2 seconds for response...")
-        await asyncio.sleep(2)
+        
+        # First attempt: Send Enter every 0.5s for 10 seconds
+        enter_timeout = 10.0
+        enter_interval = 0.5
+        start_time = time.time()
+        enter_count = 0
+        
+        self.logger.info(f"Sending Enter every {enter_interval}s for up to {enter_timeout}s...")
+        
+        while (time.time() - start_time) < enter_timeout:
+          if self.serial_conn and self.serial_conn.is_open:
+            try:
+              self.serial_conn.write(b"\r")
+              enter_count += 1
+              if enter_count % 2 == 0:  # Log every 0.5s
+                elapsed = time.time() - start_time
+                self.logger.info(f"Sending Enter... ({elapsed:.1f}s / {enter_timeout}s)")
+            except Exception as e:
+              self.logger.error(f"Error sending Enter: {e}")
+              break
+          
+          await asyncio.sleep(enter_interval)
+          
+          # Check if we received any data
+          if self.lines_received > 0:
+            elapsed = time.time() - start_time
+            self.logger.info(f"Received data after {elapsed:.1f}s, console is active")
+            break
+        
+        # If still no data, try Ctrl+C + Enter (board might be in adnl mode)
+        if self.lines_received == 0:
+          self.logger.info("Still no response, trying Ctrl+C + Enter (board might be in adnl mode)...")
+          for attempt in range(2):
+            self.send_ctrl_c_enter()
+            self.logger.info(f"Sent Ctrl+C + Enter (attempt {attempt + 1}/2)")
+            await asyncio.sleep(1.0)
+            
+            # Check if we received any data
+            if self.lines_received > 0:
+              self.logger.info("Received data after Ctrl+C + Enter, console is active")
+              break
+          
+          # Final check
+          if self.lines_received == 0:
+            self.logger.error("No response after all wake-up attempts. Please check:")
+            self.logger.error("  - Board is powered on")
+            self.logger.error("  - Serial cable is connected")
+            self.logger.error("  - Serial port permissions")
+            self.logger.error("  - Baudrate matches board configuration")
+            self.change_state(State.ERROR, "No serial response after wake-up attempts")
+            return False
+        else:
+          self.initial_wake_sent = True
       else:
         self.logger.info(
           f"Received {self.lines_received} lines already, console is active"
@@ -1143,6 +1202,36 @@ class BurnTool:
     return success
 
 
+def validate_image(image_path: Path) -> tuple[bool, str]:
+  """Validate image file
+  
+  Checks:
+  - File exists
+  - File size is at least 50MB
+  
+  Future enhancements:
+  - Binary header validation
+  - File format verification
+  - Checksum validation
+  
+  Args:
+    image_path: Path to image file
+    
+  Returns:
+    Tuple of (is_valid, error_message)
+  """
+  if not image_path.exists():
+    return False, f"Image file not found: {image_path}"
+  
+  file_size = image_path.stat().st_size
+  min_size = 50 * 1024 * 1024  # 50 MB in bytes
+  
+  if file_size < min_size:
+    return False, f"Image file too small: {image_path} ({file_size / (1024*1024):.2f} MB < {min_size / (1024*1024)} MB)"
+  
+  return True, ""
+
+
 def load_config() -> Dict[str, Any]:
   """Load configuration from config file
   
@@ -1240,6 +1329,13 @@ def main():
   )
 
   args = parser.parse_args()
+
+  # Validate image file before starting
+  image_path = Path(args.image)
+  is_valid, error_msg = validate_image(image_path)
+  if not is_valid:
+    print(f"ERROR: {error_msg}")
+    sys.exit(1)
 
   tool = BurnTool(
     serial_port=args.serial,

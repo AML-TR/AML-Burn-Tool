@@ -1,0 +1,7 @@
+{
+  "serial_port": "/dev/serial-polaris",
+  "baudrate": 921600,
+  "relay_ip": "192.168.1.220",
+  "default_image": "polaris.img"
+}
+

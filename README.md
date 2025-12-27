@@ -24,19 +24,53 @@ Event-driven Finite State Machine (FSM) based automated image flashing tool for 
 pip install -r requirements.txt
 ```
 
+## Configuration
+
+Before first use, you need to create a configuration file. The tool searches for `aml-burn-tool-config.json` in two locations (in order):
+
+1. **Local (recommended for testing)**: Same directory as the script
+2. **System-wide**: `/etc/aml-burn-tool/aml-burn-tool-config.json`
+
+**To set up configuration:**
+
+```bash
+# Option 1: Local configuration (script directory)
+cp aml-burn-tool-config.json.example aml-burn-tool-config.json
+# Edit aml-burn-tool-config.json with your settings
+
+# Option 2: System-wide configuration (requires root)
+sudo mkdir -p /etc/aml-burn-tool
+sudo cp aml-burn-tool-config.json.example /etc/aml-burn-tool/aml-burn-tool-config.json
+sudo nano /etc/aml-burn-tool/aml-burn-tool-config.json
+```
+
+**Configuration file format:**
+
+```json
+{
+  "serial_port": "/dev/serial-polaris",
+  "baudrate": 921600,
+  "relay_ip": "192.168.1.220",
+  "default_image": "polaris.img"
+}
+```
+
+- `serial_port` (required): Serial port device node (e.g., `/dev/ttyUSB0`, `/dev/serial-polaris`)
+- `baudrate` (required): Serial port baudrate (e.g., `921600`, `115200`)
+- `relay_ip` (optional): Tasmota relay IP address for automatic power cycling
+- `default_image` (optional): Default image file path if `--image` argument is not provided
+
+**Note:** Command-line arguments override config file values. For example, `--relay 192.168.1.100` will override the `relay_ip` from config.
+
 ## Usage
 
-### Basic usage (default settings):
+### Basic usage (uses config file values):
 
 ```bash
 ./aml-burn-tool.py
 ```
 
-This uses default values:
-- Serial port: `/dev/serial-polaris`
-- Baudrate: `921600`
-- Image: `polaris.img`
-- No relay (manual power cycle required)
+This uses values from your configuration file. If config file is not found, the script will exit with an error.
 
 ### With custom image file:
 

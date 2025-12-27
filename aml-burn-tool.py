@@ -6,6 +6,7 @@ Event-driven FSM for automated image flashing via serial port and adnl_burn_pkg
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -1142,30 +1143,100 @@ class BurnTool:
     return success
 
 
+def load_config() -> Dict[str, Any]:
+  """Load configuration from config file
+  
+  Searches in:
+  1. Script directory: ./aml-burn-tool-config.json
+  2. System-wide: /etc/aml-burn-tool/aml-burn-tool-config.json
+  
+  Returns:
+    Dict with config values
+    
+  Raises:
+    SystemExit: If config file not found or invalid
+  """
+  config_name = "aml-burn-tool-config.json"
+  
+  # Get script directory
+  script_dir = Path(__file__).parent.absolute()
+  local_config = script_dir / config_name
+  system_config = Path("/etc/aml-burn-tool") / config_name
+  
+  # Try local config first, then system-wide
+  config_path = None
+  if local_config.exists():
+    config_path = local_config
+  elif system_config.exists():
+    config_path = system_config
+  else:
+    print("ERROR: Configuration file not found!")
+    print(f"  Expected locations:")
+    print(f"    - {local_config}")
+    print(f"    - {system_config}")
+    print(f"\n  Please copy aml-burn-tool-config.json.example to one of these locations")
+    print(f"  and configure it according to your setup.")
+    sys.exit(1)
+  
+  # Load and parse config
+  try:
+    with open(config_path, 'r') as f:
+      config = json.load(f)
+  except json.JSONDecodeError as e:
+    print(f"ERROR: Invalid JSON in config file: {config_path}")
+    print(f"  {e}")
+    sys.exit(1)
+  except Exception as e:
+    print(f"ERROR: Failed to read config file: {config_path}")
+    print(f"  {e}")
+    sys.exit(1)
+  
+  # Validate required fields
+  required_fields = ["serial_port", "baudrate"]
+  missing_fields = [field for field in required_fields if field not in config]
+  if missing_fields:
+    print(f"ERROR: Missing required fields in config file: {', '.join(missing_fields)}")
+    sys.exit(1)
+  
+  # Validate baudrate is integer
+  if not isinstance(config["baudrate"], int):
+    try:
+      config["baudrate"] = int(config["baudrate"])
+    except (ValueError, TypeError):
+      print(f"ERROR: Invalid baudrate value in config: {config['baudrate']}")
+      sys.exit(1)
+  
+  return config
+
+
 def main():
   """Main entry point"""
+  # Load config first
+  config = load_config()
+  
   parser = argparse.ArgumentParser(
     description="Amlogic SBC automated burn tool with event-driven FSM"
   )
   parser.add_argument(
     "--serial",
-    default="/dev/serial-polaris",
-    help="Serial port device (default: /dev/serial-polaris)",
+    default=config.get("serial_port", "/dev/serial-polaris"),
+    help=f"Serial port device (default from config: {config.get('serial_port', '/dev/serial-polaris')})",
   )
   parser.add_argument(
     "--baudrate",
     type=int,
-    default=921600,
-    help="Serial port baudrate (default: 921600)",
+    default=config.get("baudrate", 921600),
+    help=f"Serial port baudrate (default from config: {config.get('baudrate', 921600)})",
   )
   parser.add_argument(
     "--relay",
-    help="Tasmota relay IP address (optional)",
+    default=config.get("relay_ip"),
+    help=f"Tasmota relay IP address (default from config: {config.get('relay_ip', 'None')})",
   )
   parser.add_argument(
     "--image",
-    default="polaris.img",
-    help="Image file path (default: polaris.img)",
+    default=config.get("default_image", "polaris.img"),
+    help=f"Image file path (default from config: {config.get('default_image', 'polaris.img')})",
   )
 
   args = parser.parse_args()
@@ -1174,7 +1245,7 @@ def main():
     serial_port=args.serial,
     baudrate=args.baudrate,
     image_path=args.image,
-    relay_ip=args.relay,
+    relay_ip=args.relay if args.relay else None,
   )
 
   try:

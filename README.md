@@ -153,8 +153,157 @@ The tool uses an event-driven FSM with the following states:
 - `DOWNLOAD`: Download mode entered, running adnl_burn_pkg
 - `LINUX`: Linux booted, login prompt detected
 - `LOGIN`: Login sent, waiting for shell prompt
+- `BOOT_VERIFY`: Verifying successful boot after burn
 - `COMPLETE`: Burn completed successfully
 - `ERROR`: Error occurred
+
+### Detailed State Machine Flow
+
+The following diagram shows the complete state machine with all transitions and triggers:
+
+```mermaid
+stateDiagram-v2
+    [*] --> INIT: Start
+    
+    INIT --> BOOTROM: Pattern: bootrom/bl2 detected
+    INIT --> UBOOT: Pattern: uboot_version/uboot_prompt detected
+    INIT --> LOGIN: Pattern: login_prompt detected\nAction: Send "root"
+    INIT --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    INIT --> INIT: Pattern: bl2/bl31/bl32 after reboot\nAction: Start continuous Enter
+    
+    BOOTROM --> UBOOT: Pattern: uboot_version detected
+    BOOTROM --> BOOTROM: Pattern: bl2/bl31/bl32 after reboot\nAction: Start continuous Enter
+    
+    UBOOT --> UBOOT: Pattern: autoboot detected\nAction: Send Enter immediately
+    UBOOT --> DOWNLOAD: Pattern: uboot_prompt detected\nAction: Send "adnl" command
+    UBOOT --> LOGIN: Pattern: login_prompt detected\nAction: Send "root"
+    UBOOT --> LINUX: Pattern: login_prompt detected\n(if login already sent)
+    UBOOT --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    
+    DOWNLOAD --> DOWNLOAD: Pattern: usb_reset detected\n(USB download mode active)
+    DOWNLOAD --> DOWNLOAD: Pattern: rebooting detected\n(Expected after burn)
+    DOWNLOAD --> BOOT_VERIFY: adnl_burn_pkg successful\nAction: Reset flags
+    DOWNLOAD --> ERROR: adnl_burn_pkg failed\nImage file not found
+    
+    BOOT_VERIFY --> BOOT_VERIFY: Pattern: login_prompt detected\nAction: Send "root"
+    BOOT_VERIFY --> BOOT_VERIFY: Pattern: shell_prompt detected\nAction: Send "uname -a"
+    BOOT_VERIFY --> COMPLETE: Pattern: Kernel version detected\n(uname -a output)
+    BOOT_VERIFY --> COMPLETE: Timeout (30s)\n(With warning)
+    
+    LINUX --> LOGIN: Pattern: login_prompt detected\nAction: Send "root"
+    LINUX --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    
+    LOGIN --> INIT: Pattern: shell_prompt detected\nAction: Send "reboot -f"\nReset flags
+    
+    INIT --> ERROR: No serial data (20+ seconds)
+    INIT --> ERROR: Wake-up attempts failed\n(Relay-less mode)
+    INIT --> ERROR: Failed to catch autoboot\n(After 2 power cycles)
+    UBOOT --> ERROR: U-Boot prompt timeout\n(30s after reboot)
+    DOWNLOAD --> ERROR: adnl_burn_pkg error
+    [*] --> ERROR: Image validation failed\nSerial port error\nRelay error
+    
+    COMPLETE --> [*]: Success
+    ERROR --> [*]: Failure
+```
+
+### State Transition Details
+
+#### INIT State
+- **Entry**: Initial state when script starts
+- **Transitions**:
+  - `bootrom/bl2` pattern → **BOOTROM**: Bootloader detected
+  - `uboot_version/uboot_prompt` pattern → **UBOOT**: U-Boot detected
+  - `login_prompt` pattern → **LOGIN**: Send "root" login
+  - `shell_prompt` pattern → **INIT**: Send "reboot -f", reset flags
+  - `bl2/bl31/bl32` after reboot → **INIT**: Start continuous Enter to catch autoboot
+- **Special Actions**:
+  - After reboot, detects bootloader stages and starts continuous Enter sending (1ms interval)
+  - Handles relay-less mode wake-up sequence (Enter → Ctrl+C+Enter)
+
+#### BOOTROM State
+- **Entry**: BootROM or BL2 bootloader detected
+- **Transitions**:
+  - `uboot_version` pattern → **UBOOT**: U-Boot bootloader detected
+  - `bl2/bl31/bl32` after reboot → **BOOTROM**: Start continuous Enter
+- **Purpose**: Intermediate state during bootloader stages
+
+#### UBOOT State
+- **Entry**: U-Boot detected or U-Boot prompt seen
+- **Transitions**:
+  - `autoboot` pattern → **UBOOT**: Send Enter immediately to stop autoboot
+  - `uboot_prompt` pattern → **DOWNLOAD**: Send "adnl" command (only once)
+  - `login_prompt` pattern → **LOGIN/LINUX**: Send "root" login
+  - `shell_prompt` pattern → **INIT**: Send "reboot -f", reset flags
+- **Special Actions**:
+  - After reboot, stops continuous Enter when prompt detected
+  - Sends "adnl" command only once (tracked by `adnl_sent` flag)
+
+#### DOWNLOAD State
+- **Entry**: "adnl" command sent, download mode entered
+- **Transitions**:
+  - `usb_reset` pattern → **DOWNLOAD**: USB download mode active (monitoring)
+  - `rebooting` pattern → **DOWNLOAD**: Board rebooting after burn (expected)
+  - adnl_burn_pkg success → **BOOT_VERIFY**: Reset flags, verify boot
+  - adnl_burn_pkg failure → **ERROR**: Burn failed
+- **Special Actions**:
+  - Runs `sudo adnl_burn_pkg -p <image> -r 1` asynchronously
+  - Monitors for "burn successful" message
+  - Serial port remains open during burn process
+  - `-r 1` flag automatically reboots board after successful burn
+
+#### BOOT_VERIFY State
+- **Entry**: adnl_burn_pkg completed successfully
+- **Transitions**:
+  - `login_prompt` pattern → **BOOT_VERIFY**: Send "root" login
+  - `shell_prompt` pattern → **BOOT_VERIFY**: Send "uname -a" to verify kernel
+  - Kernel version detected → **COMPLETE**: Boot verified successfully
+  - Timeout (30s) → **COMPLETE**: With warning message
+- **Purpose**: Verify that board booted successfully after burn
+
+#### LINUX State
+- **Entry**: Linux login prompt detected (from UBOOT state)
+- **Transitions**:
+  - `login_prompt` pattern → **LOGIN**: Send "root" login
+  - `shell_prompt` pattern → **INIT**: Send "reboot -f", reset flags
+- **Purpose**: Handle case where board boots to Linux instead of U-Boot
+
+#### LOGIN State
+- **Entry**: Login sent, waiting for shell prompt
+- **Transitions**:
+  - `shell_prompt` pattern → **INIT**: Send "reboot -f", reset flags
+- **Purpose**: Handle login process and reboot to get back to U-Boot
+
+#### COMPLETE State
+- **Entry**: Boot verification successful or timeout
+- **Exit**: Script completes successfully
+- **Purpose**: Final success state
+
+#### ERROR State
+- **Entry**: Any error condition detected
+- **Exit**: Script exits with error code
+- **Error Conditions**:
+  - Image file not found or invalid
+  - Serial port errors
+  - Relay connectivity errors
+  - adnl_burn_pkg failures
+  - Timeouts (no serial data, U-Boot prompt not detected)
+  - Wake-up sequence failures (relay-less mode)
+
+### Pattern Detection
+
+The following patterns trigger state transitions:
+
+- **`autoboot`**: "Hit any key to stop autoboot" → Triggers immediate Enter
+- **`uboot_prompt`**: U-Boot prompt (`s4_polaris#`, `=>`, `U-Boot>`) → Enter download mode
+- **`uboot_version`**: "U-Boot X.Y" → U-Boot detected
+- **`login_prompt`**: "login:" → Send root login
+- **`shell_prompt`**: "root@hostname:~#" → Linux shell detected
+- **`bootrom`**: "chip_family_id" or "ops_bining" → BootROM detected
+- **`bl2`**: "BL2" or "BL2E" bootloader messages → Bootloader stage
+- **`bl31`**: "BL31" messages → TrustZone bootloader
+- **`bl32`**: "BL32" or "BL3-2" messages → Secure OS
+- **`usb_reset`**: "USB RESET" → USB download mode active
+- **`rebooting`**: "Rebooting." or "Restarting system" → Board rebooting
 
 ## Pattern Detection
 

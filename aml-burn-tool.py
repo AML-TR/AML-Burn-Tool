@@ -42,6 +42,7 @@ class State(Enum):
   LINUX = "LINUX"
   LOGIN = "LOGIN"
   BOOT_VERIFY = "BOOT_VERIFY"  # Verifying successful boot
+  BOARD_INFO = "BOARD_INFO"  # Collecting board information
   COMPLETE = "COMPLETE"
   ERROR = "ERROR"
 
@@ -124,6 +125,7 @@ class BurnTool:
     self.serial_log = self.session_log_dir / f"serial_{timestamp}.log"
     self.adnl_log = self.session_log_dir / f"adnl_{timestamp}.log"
     self.script_log = self.session_log_dir / f"script_{timestamp}.log"
+    self.board_info_md = self.session_log_dir / "board-info.md"
 
     # Setup logging
     self.setup_logging()
@@ -138,6 +140,14 @@ class BurnTool:
     self.first_data_timeout = 30  # 30 seconds timeout for first data
     self.last_line_time = None  # Timestamp of last received line
     self.boot_verify_sent = False  # Track if uname -a sent
+    # Board info collection
+    self.board_info_uname_received = False  # Track if uname -a output received
+    self.board_info_collection_queue = []  # Queue of commands to execute
+    self.board_info_current_command = None  # Current command being executed
+    self.board_info_output = {}  # Dictionary to store collected information
+    self.board_info_collecting = False  # Flag to track if we're collecting output
+    self.board_info_output_buffer = []  # Buffer for current command output
+    self.board_info_initialized = False  # Track if collection queue initialized
     self.boot_verify_timeout = 120  # 2 minutes to verify boot after burn
     self.no_lines_warning_count = 0  # Count consecutive "no new lines" warnings
     self.burn_complete_time = None  # Timestamp when burn completed
@@ -668,13 +678,17 @@ class BurnTool:
       
       # Check if line contains kernel version (uname -a output)
       # Look for Linux kernel version string
-      if self.boot_verify_sent and (
+      if self.boot_verify_sent and not self.board_info_uname_received and (
         "Linux" in line
         and ("#1" in line or "SMP" in line or "PREEMPT" in line or "GNU/Linux" in line)
       ):
-        # Kernel version detected, boot successful
+        # Kernel version detected, boot successful - now collect board info
         self.logger.info(f"Kernel version detected: {line[:100]}")
-        self.change_state(State.COMPLETE, "Boot verified successfully")
+        self.board_info_uname_received = True
+        self.logger.info("Boot verified successfully, calling collect_board_info.py")
+        # Call external collect_board_info.py script
+        self._call_collect_board_info_script()
+        self.change_state(State.COMPLETE, "Boot verified and board information collected")
 
     elif self.state == State.LINUX:
       if pattern == "login_prompt" and not self.login_sent:
@@ -736,6 +750,242 @@ class BurnTool:
         self.uboot_prompt_seen_after_reboot = False
         self.stop_enter_sending = False
         self.change_state(State.INIT, "Rebooting to start over")
+
+  def _initialize_board_info_collection(self):
+    """Initialize board info collection queue with all commands"""
+    # Device tree command: try tree first, then find
+    device_tree_cmd = "if command -v tree >/dev/null 2>&1; then tree /proc/device-tree; else find /proc/device-tree -type f 2>/dev/null | while read f; do echo \"=== $f ===\"; cat \"$f\" 2>/dev/null; done; fi"
+    
+    self.board_info_collection_queue = [
+      {"cmd": "hostname", "section": "system", "title": "Hostname"},
+      {"cmd": "lsmod", "section": "kernel", "title": "Loaded Kernel Modules"},
+      {"cmd": "ip a", "section": "network", "title": "Network Interfaces"},
+      {"cmd": "zcat /proc/config.gz 2>/dev/null || echo 'Kernel config not available'", "section": "kernel", "title": "Kernel Configuration"},
+      {"cmd": "cat /etc/version 2>/dev/null || echo 'Not available'", "section": "system", "title": "Version Information"},
+      {"cmd": "cat /etc/os-release 2>/dev/null || echo 'Not available'", "section": "system", "title": "OS Release Information"},
+      {"cmd": "df -h", "section": "storage", "title": "Filesystem Usage"},
+      {"cmd": "mount", "section": "storage", "title": "Mounted Filesystems"},
+      {"cmd": "fdisk -l 2>/dev/null || echo 'fdisk not available'", "section": "storage", "title": "Partition Table"},
+      {"cmd": "cat /proc/cpuinfo", "section": "hardware", "title": "CPU Information"},
+      {"cmd": "cat /proc/meminfo", "section": "hardware", "title": "Memory Information"},
+      {"cmd": device_tree_cmd, "section": "hardware", "title": "Device Tree"},
+      {"cmd": "ls -la /sys/kernel/debug 2>/dev/null | head -n 50", "section": "debug", "title": "Debug Filesystem Contents"},
+      {"cmd": "find /sys/kernel/debug/pinctrl -type f 2>/dev/null | head -n 20", "section": "debug", "title": "Pinctrl Debug Files"},
+      {"cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null | head -n 100", "section": "debug", "title": "Pinmux Configuration"},
+    ]
+    self.board_info_output = {}
+    self.board_info_output_buffer = []
+    self.board_info_collecting = False
+    self.board_info_current_command = None
+    self.logger.info(f"Initialized board info collection with {len(self.board_info_collection_queue)} commands")
+
+  def _start_next_board_info_command(self):
+    """Start the next command in the collection queue"""
+    if not self.board_info_collection_queue:
+      return
+    
+    cmd_info = self.board_info_collection_queue.pop(0)
+    self.board_info_current_command = cmd_info
+    self.board_info_output_buffer = []
+    self.board_info_collecting = True
+    
+    self.logger.info(f"Collecting: {cmd_info['title']} ({cmd_info['cmd']})")
+    self.send_serial_command(cmd_info['cmd'])
+
+  def _save_current_command_output(self):
+    """Save collected output for current command"""
+    if not self.board_info_current_command:
+      return
+    
+    cmd_info = self.board_info_current_command
+    section = cmd_info['section']
+    title = cmd_info['title']
+    
+    if section not in self.board_info_output:
+      self.board_info_output[section] = {}
+    
+    self.board_info_output[section][title] = {
+      'command': cmd_info['cmd'],
+      'output': '\n'.join(self.board_info_output_buffer)
+    }
+    
+    self.board_info_collecting = False
+    self.board_info_current_command = None
+    self.board_info_output_buffer = []
+    
+    self.logger.info(f"Saved: {title} ({len(self.board_info_output[section][title]['output'])} chars)")
+
+  def _generate_board_info_markdown(self):
+    """Generate markdown file with collected board information"""
+    sections_order = ['system', 'kernel', 'hardware', 'network', 'storage', 'debug']
+    sections_titles = {
+      'system': 'System Information',
+      'kernel': 'Kernel Information',
+      'hardware': 'Hardware Information',
+      'network': 'Network Information',
+      'storage': 'Storage Information',
+      'debug': 'Debug Information'
+    }
+    
+    md_lines = []
+    md_lines.append("# Board Information")
+    md_lines.append("")
+    # Add hostname if available
+    hostname = self.board_info_output.get('system', {}).get('Hostname', {}).get('output', '').strip()
+    if hostname:
+      md_lines.append(f"**Hostname:** `{hostname}`")
+      md_lines.append("")
+    md_lines.append(f"*Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    md_lines.append("")
+    
+    # Table of Contents
+    md_lines.append("## Table of Contents")
+    md_lines.append("")
+    for section in sections_order:
+      if section in self.board_info_output:
+        md_lines.append(f"- [{sections_titles[section]}](#{section.replace('_', '-')}-information)")
+        for title in self.board_info_output[section].keys():
+          anchor = title.lower().replace(' ', '-').replace('(', '').replace(')', '')
+          md_lines.append(f"  - [{title}](#{anchor})")
+    md_lines.append("")
+    md_lines.append("---")
+    md_lines.append("")
+    
+    # Content sections
+    for section in sections_order:
+      if section not in self.board_info_output:
+        continue
+      
+      md_lines.append(f"## {sections_titles[section]}")
+      md_lines.append("")
+      
+      for title, data in self.board_info_output[section].items():
+        anchor = title.lower().replace(' ', '-').replace('(', '').replace(')', '')
+        md_lines.append(f"### {title}")
+        md_lines.append("")
+        md_lines.append(f"**Command:** `{data['command']}`")
+        md_lines.append("")
+        md_lines.append("```")
+        md_lines.append(data['output'])
+        md_lines.append("```")
+        md_lines.append("")
+      
+      md_lines.append("---")
+      md_lines.append("")
+    
+    # Write to file
+    try:
+      with open(self.board_info_md, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(md_lines))
+      self.logger.info(f"Board information saved to: {self.board_info_md}")
+    except Exception as e:
+      self.logger.error(f"Failed to write board info markdown: {e}")
+
+  def _call_collect_board_info_script(self):
+    """Call external collect_board_info.py script with real-time output"""
+    script_path = Path(__file__).parent / "collect_board_info.py"
+    if not script_path.exists():
+      self.logger.warning(f"collect_board_info.py not found at {script_path}, skipping external collection")
+      return False
+    
+    try:
+      self.logger.info("Calling collect_board_info.py for board information collection...")
+      
+      # Use Popen for real-time output streaming
+      process = subprocess.Popen(
+        [
+          sys.executable,
+          str(script_path),
+          "--serial", self.serial_port,
+          "--baudrate", str(self.baudrate),
+          "--log-dir", str(self.session_log_dir),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout
+        text=True,
+        bufsize=1,  # Line buffered
+      )
+      
+      # Read output line by line in real-time
+      start_time = time.time()
+      timeout = 300  # 5 minute timeout
+      
+      while True:
+        # Check timeout
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
+          process.kill()
+          process.wait()
+          self.logger.warning(f"collect_board_info.py timed out after {timeout} seconds")
+          return False
+        
+        # Check if process is still running
+        return_code = process.poll()
+        if return_code is not None:
+          # Process finished, read any remaining output
+          remaining = process.stdout.read()
+          if remaining:
+            for line in remaining.splitlines():
+              if line.strip():
+                self.logger.info(f"[collect_board_info] {line}")
+          break
+        
+        # Read line (with select for non-blocking check)
+        try:
+          # Use select to check if data is available (non-blocking)
+          import select
+          ready, _, _ = select.select([process.stdout], [], [], 0.1)
+          if ready:
+            # Data available, read line (should not block now)
+            line = process.stdout.readline()
+            if line:
+              line = line.rstrip()
+              if line:
+                # Log in real-time
+                self.logger.info(f"[collect_board_info] {line}")
+          else:
+            # No data available, small sleep to avoid busy waiting
+            time.sleep(0.05)
+        except (ImportError, OSError):
+          # select not available on Windows, or other OS error
+          # Fallback: just readline (may block briefly, but bufsize=1 helps)
+          try:
+            line = process.stdout.readline()
+            if line:
+              line = line.rstrip()
+              if line:
+                # Log in real-time
+                self.logger.info(f"[collect_board_info] {line}")
+            else:
+              # EOF or no data, small sleep
+              time.sleep(0.05)
+          except Exception as e:
+            self.logger.debug(f"Error reading from process: {e}")
+            time.sleep(0.1)
+      
+      # Wait for process to complete
+      return_code = process.wait()
+      
+      if return_code == 0:
+        self.logger.info("collect_board_info.py completed successfully")
+        # Verify markdown file was created
+        board_info_md = self.session_log_dir / "board-info.md"
+        if board_info_md.exists():
+          file_size = board_info_md.stat().st_size
+          self.logger.info(f"Board info markdown file created: {board_info_md} ({file_size} bytes)")
+          return True
+        else:
+          self.logger.warning(f"Board info markdown file not found at {board_info_md}")
+          return False
+      else:
+        self.logger.warning(f"collect_board_info.py exited with code {return_code}")
+        return False
+    except subprocess.TimeoutExpired:
+      self.logger.warning("collect_board_info.py timed out after 5 minutes")
+      return False
+    except Exception as e:
+      self.logger.warning(f"Failed to call collect_board_info.py: {e}")
+      return False
 
   async def run_adnl_burn_pkg(self):
     """Run adnl_burn_pkg tool and capture output (non-blocking)"""
@@ -1150,11 +1400,16 @@ class BurnTool:
         if self.state == State.COMPLETE:
           if complete_wait_start is None:
             complete_wait_start = time.time()
-            self.logger.info(
-              "Burn and boot verification complete. "
-              "Kernel version verified - boot successful!"
-            )
-          # Exit immediately after kernel verification - no need to wait
+            if self.board_info_output:
+              self.logger.info(
+                "Burn, boot verification, and board information collection complete!"
+              )
+            else:
+              self.logger.info(
+                "Burn and boot verification complete. "
+                "Kernel version verified - boot successful!"
+              )
+          # Exit immediately after completion - no need to wait
           break
 
       # Stop continuous Enter if running
@@ -1188,9 +1443,16 @@ class BurnTool:
     success = self.state == State.COMPLETE
     if success:
       self.logger.info("=" * 60)
-      self.logger.info("Burn and boot verification completed successfully!")
-      if self.boot_verify_sent:
-        self.logger.info("Kernel version verified - boot successful!")
+      # Check if board-info.md was created by collect_board_info.py
+      board_info_md = self.session_log_dir / "board-info.md"
+      if board_info_md.exists():
+        file_size = board_info_md.stat().st_size
+        self.logger.info("Burn, boot verification, and board information collection completed successfully!")
+        self.logger.info(f"Board information saved to: {board_info_md} ({file_size} bytes)")
+      else:
+        self.logger.info("Burn and boot verification completed successfully!")
+        if self.boot_verify_sent:
+          self.logger.info("Kernel version verified - boot successful!")
       self.logger.info(f"Logs saved to: {self.session_log_dir}")
       self.logger.info("=" * 60)
     else:

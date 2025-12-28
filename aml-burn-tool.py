@@ -79,9 +79,9 @@ class BurnTool:
   # Pattern definitions for state detection
   PATTERNS = {
     "autoboot": re.compile(r"Hit any key to stop autoboot", re.IGNORECASE),
-    # U-Boot prompts: s4_polaris#, a4_mainstream#, =>, U-Boot>, etc. (NOT root@)
+    # U-Boot prompts: s4_polaris#, a4_mainstream#, a4_ba400#, s6_bl201#, =>, U-Boot>, etc. (NOT root@)
     "uboot_prompt": re.compile(
-      r"(s4_polaris#|a4_mainstream#|a4_ba400#|=>|U-Boot>)\s*$", re.MULTILINE
+      r"(s4_polaris#|a4_mainstream#|a4_ba400#|s6_bl201#|=>|U-Boot>)\s*$", re.MULTILINE
     ),
     "login_prompt": re.compile(r"login:\s*$", re.MULTILINE),
     # Shell prompts: root@hostname:~# (Linux shell, NOT U-Boot)
@@ -140,6 +140,7 @@ class BurnTool:
     self.first_data_timeout = 30  # 30 seconds timeout for first data
     self.last_line_time = None  # Timestamp of last received line
     self.boot_verify_sent = False  # Track if uname -a sent
+    self.prompt_wake_attempts = 0  # Track wake-up attempts when waiting for prompt
     # Board info collection
     self.board_info_uname_received = False  # Track if uname -a output received
     self.board_info_collection_queue = []  # Queue of commands to execute
@@ -353,6 +354,27 @@ class BurnTool:
     self.serial_conn.write(b"\r")  # Enter
     time.sleep(0.1)
 
+  def send_robust_reboot(self):
+    """Send reboot -f command robustly: Ctrl+C, reset, then reboot -f"""
+    if not self.serial_conn or not self.serial_conn.is_open:
+      return
+    
+    # Step 1: Send Ctrl+C to clear any running command
+    self.serial_conn.write(b"\x03")  # Ctrl+C
+    time.sleep(0.2)
+    
+    # Step 2: Send Enter to get a clean prompt
+    self.serial_conn.write(b"\r")  # Enter
+    time.sleep(0.2)
+    
+    # Step 3: Send reset command to clear any state
+    self.serial_conn.write(b"reset\r")
+    time.sleep(0.3)
+    
+    # Step 4: Send reboot -f
+    self.send_serial_command("reboot -f", delay=0.002)
+    time.sleep(0.1)
+
   async def send_continuous_enter(self):
     """Send Enter continuously (every 1ms) to catch autoboot"""
     self.logger.info("Starting continuous Enter sending (1ms interval)")
@@ -400,6 +422,10 @@ class BurnTool:
       # Reset flags when going back to INIT
       if new_state == State.INIT:
         self.reboot_sent = False
+      
+      # Reset prompt wake attempts when state changes (prompt was detected)
+      if new_state != State.INIT:
+        self.prompt_wake_attempts = 0
 
   def match_pattern(self, line: str) -> Optional[str]:
     """Match line against known patterns, return pattern name"""
@@ -528,6 +554,9 @@ class BurnTool:
   async def process_serial_line(self, line: str):
     """Process a line from serial port and update FSM"""
     self.last_activity = time.time()
+    
+    # Reset wake-up attempts counter when we receive any data
+    self.prompt_wake_attempts = 0
 
     # Pattern matching
     pattern = self.match_pattern(line)
@@ -551,12 +580,14 @@ class BurnTool:
           self.send_serial_command("root")
           self.logger.info("Sent 'root' for login (no password)")
           self.login_sent = True
+          self.logger.info("Waiting 5 seconds after login...")
+          await asyncio.sleep(5.0)
           self.change_state(State.LOGIN, "Login sent")
       elif pattern == "shell_prompt":
         # Already booted to Linux - send reboot immediately and stay in INIT
         if not self.reboot_sent:
-          self.send_serial_command("reboot -f")
-          self.logger.info("Sent 'reboot -f' command to reboot board")
+          self.send_robust_reboot()
+          self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f)")
           self.reboot_sent = True
           # Reset flags for next cycle
           self.login_sent = False
@@ -636,6 +667,8 @@ class BurnTool:
           self.send_serial_command("root")
           self.logger.info("Sent 'root' for login (no password)")
           self.login_sent = True
+          self.logger.info("Waiting 5 seconds after login...")
+          await asyncio.sleep(5.0)
           self.change_state(State.LOGIN, "Linux login detected, login sent")
         else:
           # Already sent login, just transition to LINUX state
@@ -644,8 +677,8 @@ class BurnTool:
         # Board booted to Linux shell (autoboot wasn't caught)
         # Send reboot immediately to start over
         if not self.reboot_sent:
-          self.send_serial_command("reboot -f")
-          self.logger.info("Sent 'reboot -f' command to reboot board (from UBOOT state)")
+          self.send_robust_reboot()
+          self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f) (from UBOOT state)")
           self.reboot_sent = True
           # Reset flags for next cycle
           self.login_sent = False
@@ -670,6 +703,8 @@ class BurnTool:
         self.send_serial_command("root")
         self.logger.info("Sent 'root' for login (no password)")
         self.login_sent = True
+        self.logger.info("Waiting 5 seconds after login...")
+        await asyncio.sleep(5.0)
       elif pattern == "shell_prompt" and not self.boot_verify_sent:
         # Shell prompt detected, send uname -a to verify boot
         self.send_serial_command("uname -a")
@@ -696,12 +731,14 @@ class BurnTool:
         self.send_serial_command("root")
         self.logger.info("Sent 'root' for login")
         self.login_sent = True
+        self.logger.info("Waiting 5 seconds after login...")
+        await asyncio.sleep(5.0)
         self.change_state(State.LOGIN, "Login sent")
       elif pattern == "shell_prompt":
         if not self.reboot_sent:
           # Logged in, send reboot to go back to U-Boot
-          self.send_serial_command("reboot -f")
-          self.logger.info("Sent 'reboot -f' command to reboot board")
+          self.send_robust_reboot()
+          self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f)")
           self.reboot_sent = True
           # Reset flags for next cycle
           self.login_sent = False
@@ -716,8 +753,8 @@ class BurnTool:
       # This handles the case where we transitioned from INIT to LINUX in the same line
       if pattern == "shell_prompt" and not self.reboot_sent:
         # Send reboot immediately
-        self.send_serial_command("reboot -f")
-        self.logger.info("Sent 'reboot -f' command to reboot board (immediate)")
+        self.send_robust_reboot()
+        self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f) (immediate)")
         self.reboot_sent = True
         # Reset flags for next cycle
         self.login_sent = False
@@ -730,8 +767,8 @@ class BurnTool:
       if pattern == "shell_prompt":
         if not self.reboot_sent:
           # Logged in successfully, send reboot
-          self.send_serial_command("reboot -f")
-          self.logger.info("Sent 'reboot -f' command to reboot board")
+          self.send_robust_reboot()
+          self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f)")
           self.reboot_sent = True
           self.login_sent = False
           self.adnl_sent = False
@@ -742,8 +779,8 @@ class BurnTool:
       # This handles the case where we transitioned from INIT to LOGIN in the same line
       if pattern == "shell_prompt" and not self.reboot_sent:
         # Send reboot immediately
-        self.send_serial_command("reboot -f")
-        self.logger.info("Sent 'reboot -f' command to reboot board (immediate)")
+        self.send_robust_reboot()
+        self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f) (immediate)")
         self.reboot_sent = True
         self.login_sent = False
         self.adnl_sent = False
@@ -1082,11 +1119,93 @@ class BurnTool:
     check_interval = 1.0  # Check every second
     last_log_time = 0
     log_interval = 5.0  # Log status every 5 seconds
+    prompt_wait_start = None  # Track when we started waiting for a prompt in INIT state
 
     while self.state not in [State.COMPLETE, State.ERROR]:
       await asyncio.sleep(check_interval)
       elapsed = time.time() - self.last_activity
       current_time = time.time()
+
+      # Check if we're waiting for a prompt (INIT state with data received but no prompt yet)
+      if self.state == State.INIT and self.lines_received > 0:
+        # We have data but still in INIT - waiting for a prompt (login, shell, or uboot)
+        if prompt_wait_start is None:
+          prompt_wait_start = time.time()
+          self.logger.info("Waiting for prompt (login, shell, or uboot)...")
+        
+        wait_elapsed = time.time() - prompt_wait_start
+        
+        # First 10 seconds: wait for prompt
+        if wait_elapsed >= 10.0 and self.prompt_wake_attempts == 0:
+          # Send wake-up sequence: Ctrl+C, clear, Enter
+          self.logger.info("No prompt detected after 10 seconds, sending wake-up sequence (Ctrl+C, clear, Enter)...")
+          if self.serial_conn and self.serial_conn.is_open:
+            try:
+              # Ctrl+C
+              self.serial_conn.write(b"\x03")
+              await asyncio.sleep(0.2)
+              # clear command
+              self.serial_conn.write(b"clear\r")
+              await asyncio.sleep(0.2)
+              # Enter
+              self.serial_conn.write(b"\r")
+              await asyncio.sleep(0.2)
+              self.logger.info("Wake-up sequence sent")
+              self.prompt_wake_attempts = 1
+              prompt_wait_start = time.time()  # Reset timer for next 10 seconds
+            except Exception as e:
+              self.logger.error(f"Error sending wake-up sequence: {e}")
+        
+        # Next 10 seconds: wait again
+        elif wait_elapsed >= 10.0 and self.prompt_wake_attempts == 1:
+          # Send wake-up sequence again
+          self.logger.info("Still no prompt after another 10 seconds, sending wake-up sequence again...")
+          if self.serial_conn and self.serial_conn.is_open:
+            try:
+              # Ctrl+C
+              self.serial_conn.write(b"\x03")
+              await asyncio.sleep(0.2)
+              # clear command
+              self.serial_conn.write(b"clear\r")
+              await asyncio.sleep(0.2)
+              # Enter
+              self.serial_conn.write(b"\r")
+              await asyncio.sleep(0.2)
+              self.logger.info("Wake-up sequence sent (2nd attempt)")
+              self.prompt_wake_attempts = 2
+              prompt_wait_start = time.time()  # Reset timer for final 10 seconds
+            except Exception as e:
+              self.logger.error(f"Error sending wake-up sequence: {e}")
+        
+        # Final 10 seconds: if still no prompt, error
+        elif wait_elapsed >= 10.0 and self.prompt_wake_attempts == 2:
+          self.logger.error("=" * 60)
+          self.logger.error("CRITICAL: No prompt detected after 30 seconds (10s + wake-up + 10s + wake-up + 10s)")
+          self.logger.error("=" * 60)
+          self.logger.error("")
+          self.logger.error("Please check the following:")
+          self.logger.error("")
+          self.logger.error("1. Are you sure the board is accessible via serial UART?")
+          self.logger.error("   - Check serial cable connection")
+          self.logger.error("   - Verify serial port path: " + self.serial_port)
+          self.logger.error("   - Check baudrate matches board configuration: " + str(self.baudrate))
+          self.logger.error("")
+          self.logger.error("2. Are you sure the board is powered on?")
+          self.logger.error("   - Check power LED indicators")
+          self.logger.error("   - Verify power supply is connected and working")
+          self.logger.error("")
+          self.logger.error("3. If both above are OK, but still no prompt:")
+          self.logger.error("   - Board might be in an unexpected state")
+          self.logger.error("   - Try manually power cycling the board")
+          self.logger.error("   - Or use relay (--relay <IP>) to power cycle")
+          self.logger.error("")
+          self.logger.error("=" * 60)
+          self.change_state(State.ERROR, "No prompt detected after 30 seconds with wake-up attempts")
+          break
+      else:
+        # Not waiting for prompt, reset timer
+        prompt_wait_start = None
+        self.prompt_wake_attempts = 0
 
       # Log status periodically (only after initial wake sequence)
       if self.initial_wake_sent and current_time - last_log_time > log_interval:
@@ -1103,38 +1222,6 @@ class BurnTool:
         )
         if last_line_elapsed > 10:
           status_msg += " [WARNING: No new lines for 10+ seconds]"
-          self.no_lines_warning_count += 1
-          
-          # If we've warned 2 times (approximately 20 seconds total), stop with detailed error
-          # First warning at ~10s, second at ~15s, so we stop after second warning
-          if self.no_lines_warning_count >= 2:
-            self.logger.error("=" * 60)
-            self.logger.error("CRITICAL: No serial data received for 20+ seconds")
-            self.logger.error("=" * 60)
-            self.logger.error("")
-            self.logger.error("Please check the following:")
-            self.logger.error("")
-            self.logger.error("1. Are you sure the board is accessible via serial UART?")
-            self.logger.error("   - Check serial cable connection")
-            self.logger.error("   - Verify serial port path: " + self.serial_port)
-            self.logger.error("   - Check baudrate matches board configuration: " + str(self.baudrate))
-            self.logger.error("")
-            self.logger.error("2. Are you sure the board is powered on?")
-            self.logger.error("   - Check power LED indicators")
-            self.logger.error("   - Verify power supply is connected and working")
-            self.logger.error("")
-            self.logger.error("3. If both above are OK, but still no update from serial:")
-            self.logger.error("   - Board kernel might be crashed")
-            self.logger.error("   - Either use relay (--relay <IP>) to power cycle")
-            self.logger.error("   - Or manually power cycle the board")
-            self.logger.error("")
-            self.logger.error("=" * 60)
-            self.change_state(State.ERROR, "No serial data for 20+ seconds")
-            break
-        else:
-          # Reset counter if we received data
-          self.no_lines_warning_count = 0
-        
         self.logger.info(status_msg)
         last_log_time = current_time
 

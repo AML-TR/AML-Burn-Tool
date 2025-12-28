@@ -26,7 +26,7 @@ except ImportError:
 class BoardInfoCollector:
   """Collect board information via serial port - synchronous version"""
   
-  VERSION = "v2.0"  # Script version
+  VERSION = "v3.1"  # Script version (v3.1: improved buffer-based reading like pinmux_get.py)
 
   # ANSI color codes for log prefixes (only if stdout is a TTY)
   @staticmethod
@@ -55,7 +55,7 @@ class BoardInfoCollector:
   # Pattern definitions
   PATTERNS = {
     "login_prompt": re.compile(r"login:\s*$", re.MULTILINE),
-    "shell_prompt": re.compile(r"root@.*?:\~#\s*$", re.MULTILINE),
+    "shell_prompt": re.compile(r"root@.*?:\~#\s*$"),  # Removed MULTILINE, match anywhere in string
     "uboot_prompt": re.compile(
       r"(s4_polaris#|a4_mainstream#|a4_ba400#|=>|U-Boot>)\s*$", re.MULTILINE
     ),
@@ -66,10 +66,14 @@ class BoardInfoCollector:
     serial_port: str,
     baudrate: int,
     log_dir: Optional[Path] = None,
+    open_md: bool = False,
+    open_pdf: bool = False,
   ):
     self.serial_port = serial_port
     self.baudrate = baudrate
     self.serial_conn = None
+    self.open_md = open_md
+    self.open_pdf = open_pdf
     
     # Setup log directory
     if log_dir:
@@ -92,25 +96,25 @@ class BoardInfoCollector:
     # 3. Kernel (uname, lsmod, config, device-tree)
     self.commands = [
       # Operating System Information
-      {"cmd": "cat /etc/os-release 2>/dev/null || echo 'Not available'", "section": "system", "title": "OS Release Information"},
-      {"cmd": "cat /etc/version 2>/dev/null || echo 'Not available'", "section": "system", "title": "Version Information"},
+      {"cmd": "cat /etc/os-release", "section": "system", "title": "OS Release Information"},
+      {"cmd": "cat /etc/version", "section": "system", "title": "Version Information"},
       {"cmd": "hostname", "section": "system", "title": "Hostname"},
       # Board Hardware Information
       {"cmd": "cat /proc/cpuinfo", "section": "hardware", "title": "CPU Information"},
       {"cmd": "cat /proc/meminfo", "section": "hardware", "title": "Memory Information"},
       {"cmd": "df -h", "section": "storage", "title": "Filesystem Usage"},
       {"cmd": "mount", "section": "storage", "title": "Mounted Filesystems"},
-      {"cmd": "fdisk -l 2>/dev/null || echo 'fdisk not available'", "section": "storage", "title": "Partition Table"},
+      {"cmd": "fdisk -l", "section": "storage", "title": "Partition Table"},
       {"cmd": "ip a", "section": "network", "title": "Network Interfaces"},
       # Kernel Information
       {"cmd": "uname -a", "section": "kernel", "title": "Kernel Information"},
       {"cmd": "lsmod", "section": "kernel", "title": "Loaded Kernel Modules"},
-      {"cmd": "zcat /proc/config.gz 2>/dev/null || echo 'Kernel config not available'", "section": "kernel", "title": "Kernel Configuration"},
+      {"cmd": "zcat /proc/config.gz", "section": "kernel", "title": "Kernel Configuration"},
       {"cmd": "find /proc/device-tree/", "section": "kernel", "title": "Device Tree"},
       # Debug Information
-      {"cmd": "ls -la /sys/kernel/debug 2>/dev/null", "section": "debug", "title": "Debug Filesystem Contents"},
-      {"cmd": "find /sys/kernel/debug/pinctrl -type f 2>/dev/null", "section": "debug", "title": "Pinctrl Debug Files"},
-      {"cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null", "section": "debug", "title": "Pinmux Configuration"},
+      {"cmd": "ls -la /sys/kernel/debug", "section": "debug", "title": "Debug Filesystem Contents"},
+      {"cmd": "find /sys/kernel/debug/pinctrl -type f", "section": "debug", "title": "Pinctrl Debug Files"},
+      {"cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins", "section": "debug", "title": "Pinmux Configuration"},
     ]
     self.collected_data = {}
 
@@ -240,67 +244,100 @@ class BoardInfoCollector:
     return None
 
   def collect_command_output(self, command: Dict[str, str]) -> str:
-    """Collect output for a single command - simple: send command, read until shell prompt"""
+    """Collect output for a single command - simple buffer-based approach: read everything until shell prompt"""
     cmd = command["cmd"]
     title = command["title"]
     
     self.logger.info(f"Collecting: {title}")
     
-    # Flush any pending data
-    self.serial_conn.reset_input_buffer()
+    # Add error handling: append "|| echo 'command not found'" to command
+    cmd_with_fallback = f"{cmd} || echo 'command not found'"
     
-    # Send command (no marker, just the command)
-    self.send_command(cmd, send_ctrl_c=False)
+    # Send command directly (exactly like pinmux_get.py) - no buffer flush
+    color = self.COLORS["SERIAL"]
+    reset = self.COLORS["RESET"]
+    self.logger.info(f"{color}[Serial]{reset} Sending: {cmd}")
+    self.serial_conn.write(f"{cmd_with_fallback}\r\n".encode())
+    # Small delay to allow command to start executing (especially for fast commands)
+    time.sleep(0.05)
     
-    # Read lines until we see shell prompt
-    output_lines = []
+    # Read everything until shell prompt appears - simple buffer-based approach (like pinmux_get.py)
+    # Use same regex pattern as pinmux_get.py for consistency
+    shell_prompt_pattern = re.compile(r"root@.*?:\~#\s*$")
+    output_buffer = ""
     start_time = time.time()
-    timeout = 60.0  # Max 60 seconds per command (increased for long outputs)
-    last_output_time = start_time
-    no_output_timeout = 3.0  # If no output for 3 seconds after getting some output, assume command is done
+    timeout = 60.0  # Max 60 seconds per command
+    read_count = 0
+    last_data_time = start_time
+    no_data_count = 0
     
     while time.time() - start_time < timeout:
-      line = self.read_line(timeout=1.0)
-      if line is None:
-        # No line read, check if we've been waiting too long without output
-        elapsed_no_output = time.time() - last_output_time
-        if elapsed_no_output > no_output_timeout and len(output_lines) > 0:
-          # We have some output but nothing new for 3 seconds, check for shell prompt in buffer
-          # Read one more time to catch shell prompt that might be in buffer
-          final_line = self.read_line(timeout=0.5)
-          if final_line and self.PATTERNS["shell_prompt"].search(final_line):
-            self.logger.info(f"Shell prompt detected after no-output timeout, saving output ({len(output_lines)} lines)")
-          else:
-            self.logger.info(f"No new output for {elapsed_no_output:.1f}s, assuming command complete ({len(output_lines)} lines)")
+      elapsed = time.time() - start_time
+      # Always try to read available data (same as pinmux_get.py - no null byte filtering)
+      if self.serial_conn.in_waiting > 0:
+        data = self.serial_conn.read(self.serial_conn.in_waiting).decode("utf-8", errors="ignore")
+        output_buffer += data
+        read_count += 1
+        last_data_time = time.time()
+        no_data_count = 0
+        
+        # Check for shell prompt in the buffer (check last 200 chars to be efficient)
+        if len(output_buffer) > 200:
+          check_region = output_buffer[-200:]
+        else:
+          check_region = output_buffer
+        
+        # Search for shell prompt anywhere in the check region (same as pinmux_get.py)
+        if shell_prompt_pattern.search(check_region):
+          self.logger.info(f"Shell prompt detected, stopping read (read {read_count} times, {len(output_buffer)} chars)")
           break
-        continue
-      
-      last_output_time = time.time()  # Update last output time
-      
-      # Check for shell prompt - if we see it, command is done
+      else:
+        no_data_count += 1
+        elapsed_no_data = time.time() - last_data_time
+        # Log if no data for more than 1 second (every 20 iterations = 1 second)
+        if no_data_count % 20 == 0 and output_buffer:
+          self.logger.debug(f"No data for {elapsed_no_data:.1f}s, buffer: {len(output_buffer)} chars")
+        
+        # No data available - but if we have output, check if shell prompt is already there
+        if output_buffer:
+          # Check entire buffer for shell prompt
+          if shell_prompt_pattern.search(output_buffer):
+            self.logger.info(f"Shell prompt found in buffer (no data for {elapsed_no_data:.1f}s)")
+            break
+        time.sleep(0.05)  # Small sleep when no data
+    
+    # Clean up output: remove command echo and shell prompt (same logic as pinmux_get.py)
+    lines = output_buffer.split('\n')
+    result_lines = []
+    
+    for line in lines:
+      line = line.strip()
+      # Skip command echo - check if line starts with shell prompt and contains command
       if self.PATTERNS["shell_prompt"].search(line):
-        self.logger.info(f"Shell prompt detected, saving output ({len(output_lines)} lines)")
-        break
-      
-      # Filter out unwanted lines
-      if (line.strip() and 
-          line.strip() != cmd and 
-          not line.strip().endswith(cmd) and
-          line.strip() != "clear" and
-          not line.strip().startswith("clear") and
-          not line.strip().startswith("root@") and
-          not re.match(r'^\x1b\[', line.strip())):  # Filter ANSI escape sequences
-        output_lines.append(line)
-        self.logger.debug(f"Collected output line: {line[:80]}")
+        continue
+      # Skip lines that are exactly the command (command echo)
+      if line == cmd or line == cmd_with_fallback:
+        continue
+      # Skip lines that start with shell prompt pattern followed by command
+      if re.match(r'^root@.*?:\~#\s*' + re.escape(cmd) + r'\s*$', line):
+        continue
+      # Skip "command not found" message
+      if line == "command not found":
+        continue
+      # Skip empty lines
+      if not line:
+        continue
+      result_lines.append(line)
     
-    # Check if we timed out
-    elapsed = time.time() - start_time
-    if elapsed >= timeout:
-      self.logger.warning(f"Command timeout after {elapsed:.1f}s, saving collected output ({len(output_lines)} lines)")
-    
-    output = "\n".join(output_lines)
+    output = "\n".join(result_lines)
     output_size = len(output)
-    self.logger.info(f"Saved: {title} ({output_size} chars)")
+    elapsed = time.time() - start_time
+    
+    # Debug: log buffer content if output is empty
+    if output_size == 0 and len(output_buffer) > 0:
+      self.logger.debug(f"Empty output but buffer had {len(output_buffer)} chars. First 200 chars: {repr(output_buffer[:200])}")
+    
+    self.logger.info(f"Saved: {title} ({output_size} chars, {elapsed:.2f}s, {read_count} reads)")
     
     return output
 
@@ -391,6 +428,10 @@ class BoardInfoCollector:
       self.generate_markdown()
       
       self.logger.info("Collection complete!")
+      
+      # Open generated files with xdg-open
+      self.open_generated_files()
+      
       return True
       
     except serial.SerialException as e:
@@ -459,6 +500,7 @@ class BoardInfoCollector:
       
       for title, data in sections[section]:
         md_lines.append(f"### {title}\n")
+        # Command is already clean (no || echo parts in self.commands)
         md_lines.append(f"**Command:** `{data['command']}`\n")
         md_lines.append("\n")
         md_lines.append("```\n")
@@ -738,6 +780,33 @@ class BoardInfoCollector:
         
     except Exception as e:
       self.logger.warning(f"Failed to generate PDF: {e}")
+  
+  def open_generated_files(self):
+    """Open generated markdown and PDF files with xdg-open based on flags"""
+    try:
+      # Open markdown file if requested
+      if self.open_md and self.board_info_md.exists():
+        self.logger.info(f"Opening markdown file: {self.board_info_md}")
+        subprocess.Popen(
+          ["xdg-open", str(self.board_info_md)],
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+        )
+      
+      # Open PDF file if requested and it exists
+      if self.open_pdf:
+        pdf_path = self.board_info_md.with_suffix('.pdf')
+        if pdf_path.exists():
+          self.logger.info(f"Opening PDF file: {pdf_path}")
+          subprocess.Popen(
+            ["xdg-open", str(pdf_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+          )
+        else:
+          self.logger.warning("PDF file not found, skipping open")
+    except Exception as e:
+      self.logger.warning(f"Failed to open files with xdg-open: {e}")
 
 
 def load_config() -> Dict[str, Any]:
@@ -776,6 +845,16 @@ def main():
     default=None,
     help="Log directory (if called from aml-burn-tool.py)",
   )
+  parser.add_argument(
+    "--md",
+    action="store_true",
+    help="Open markdown file after generation",
+  )
+  parser.add_argument(
+    "--pdf",
+    action="store_true",
+    help="Open PDF file after generation",
+  )
   
   args = parser.parse_args()
   
@@ -783,6 +862,8 @@ def main():
     serial_port=args.serial,
     baudrate=args.baudrate,
     log_dir=args.log_dir,
+    open_md=args.md,
+    open_pdf=args.pdf,
   )
   
   success = collector.run()

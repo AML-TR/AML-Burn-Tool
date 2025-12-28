@@ -1,0 +1,26 @@
+{
+  "boards": [
+    {
+      "name": "polaris",
+      "serial_port": "/dev/serial-polaris",
+      "baudrate": 921600,
+      "relay_ip": "192.168.1.220",
+      "default_image": "polaris.img"
+    },
+    {
+      "name": "ms-esr1a",
+      "serial_port": "/dev/serial-signify-pro",
+      "baudrate": 921600,
+      "relay_ip": null,
+      "default_image": "ms-esr1a.img"
+    },
+    {
+      "name": "raman",
+      "serial_port": "/dev/ttyUSB3",
+      "baudrate": 921600,
+      "relay_ip": "192.168.1.202",
+      "default_image": "raman.img"
+    }
+  ]
+}
+

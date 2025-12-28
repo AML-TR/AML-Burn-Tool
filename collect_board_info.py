@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -24,6 +25,8 @@ except ImportError:
 
 class BoardInfoCollector:
   """Collect board information via serial port - synchronous version"""
+  
+  VERSION = "v2.0"  # Script version
 
   # ANSI color codes for log prefixes (only if stdout is a TTY)
   @staticmethod
@@ -83,24 +86,31 @@ class BoardInfoCollector:
     # Setup logging
     self.setup_logging()
     
-    # Board info collection
+    # Board info collection - hierarchical order:
+    # 1. Operating System (os-release, version, hostname)
+    # 2. Board Hardware (CPU, Memory, Disk, Network)
+    # 3. Kernel (uname, lsmod, config, device-tree)
     self.commands = [
-      {"cmd": "hostname", "section": "system", "title": "Hostname"},
-      {"cmd": "uname -a", "section": "kernel", "title": "Kernel Information"},
-      {"cmd": "lsmod", "section": "kernel", "title": "Loaded Kernel Modules"},
-      {"cmd": "ip a", "section": "network", "title": "Network Interfaces"},
-      {"cmd": "zcat /proc/config.gz 2>/dev/null || echo 'Kernel config not available'", "section": "kernel", "title": "Kernel Configuration"},
-      {"cmd": "cat /etc/version 2>/dev/null || echo 'Not available'", "section": "system", "title": "Version Information"},
+      # Operating System Information
       {"cmd": "cat /etc/os-release 2>/dev/null || echo 'Not available'", "section": "system", "title": "OS Release Information"},
+      {"cmd": "cat /etc/version 2>/dev/null || echo 'Not available'", "section": "system", "title": "Version Information"},
+      {"cmd": "hostname", "section": "system", "title": "Hostname"},
+      # Board Hardware Information
+      {"cmd": "cat /proc/cpuinfo", "section": "hardware", "title": "CPU Information"},
+      {"cmd": "cat /proc/meminfo", "section": "hardware", "title": "Memory Information"},
       {"cmd": "df -h", "section": "storage", "title": "Filesystem Usage"},
       {"cmd": "mount", "section": "storage", "title": "Mounted Filesystems"},
       {"cmd": "fdisk -l 2>/dev/null || echo 'fdisk not available'", "section": "storage", "title": "Partition Table"},
-      {"cmd": "cat /proc/cpuinfo", "section": "hardware", "title": "CPU Information"},
-      {"cmd": "cat /proc/meminfo", "section": "hardware", "title": "Memory Information"},
-      {"cmd": "find /proc/device-tree/", "section": "hardware", "title": "Device Tree"},
-      {"cmd": "ls -la /sys/kernel/debug 2>/dev/null | head -n 50", "section": "debug", "title": "Debug Filesystem Contents"},
-      {"cmd": "find /sys/kernel/debug/pinctrl -type f 2>/dev/null | head -n 20", "section": "debug", "title": "Pinctrl Debug Files"},
-      {"cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null | head -n 100", "section": "debug", "title": "Pinmux Configuration"},
+      {"cmd": "ip a", "section": "network", "title": "Network Interfaces"},
+      # Kernel Information
+      {"cmd": "uname -a", "section": "kernel", "title": "Kernel Information"},
+      {"cmd": "lsmod", "section": "kernel", "title": "Loaded Kernel Modules"},
+      {"cmd": "zcat /proc/config.gz 2>/dev/null || echo 'Kernel config not available'", "section": "kernel", "title": "Kernel Configuration"},
+      {"cmd": "find /proc/device-tree/", "section": "kernel", "title": "Device Tree"},
+      # Debug Information
+      {"cmd": "ls -la /sys/kernel/debug 2>/dev/null", "section": "debug", "title": "Debug Filesystem Contents"},
+      {"cmd": "find /sys/kernel/debug/pinctrl -type f 2>/dev/null", "section": "debug", "title": "Pinctrl Debug Files"},
+      {"cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null", "section": "debug", "title": "Pinmux Configuration"},
     ]
     self.collected_data = {}
 
@@ -174,6 +184,10 @@ class BoardInfoCollector:
         char = self.serial_conn.read(1)
         if char == b"\n":
           line = line_buffer.decode("utf-8", errors="ignore").strip()
+          # Remove ANSI escape sequences (including cursor position queries like ;231R)
+          line = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', line)  # Standard ANSI escape sequences
+          line = re.sub(r';\d+R', '', line)  # Cursor position responses like ;231R
+          line = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', line)  # Other control characters
           return line
         elif char != b"\r":  # Ignore carriage return
           line_buffer += char
@@ -182,7 +196,12 @@ class BoardInfoCollector:
     
     # Timeout - return what we have
     if line_buffer:
-      return line_buffer.decode("utf-8", errors="ignore").strip()
+      line = line_buffer.decode("utf-8", errors="ignore").strip()
+      # Remove ANSI escape sequences
+      line = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', line)
+      line = re.sub(r';\d+R', '', line)
+      line = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', line)
+      return line
     return None
 
   def wait_for_prompt(self, timeout: float = 10.0) -> Optional[str]:
@@ -227,16 +246,7 @@ class BoardInfoCollector:
     
     self.logger.info(f"Collecting: {title}")
     
-    # Clear screen first and flush any pending data
-    self.serial_conn.reset_input_buffer()  # Clear input buffer before clear
-    self.send_command("clear", send_ctrl_c=False)
-    time.sleep(0.3)  # Wait for clear to complete
-    
-    # Read and discard any remaining data from clear command
-    while self.serial_conn.in_waiting > 0:
-      self.read_line(timeout=0.1)
-    
-    # Final buffer flush
+    # Flush any pending data
     self.serial_conn.reset_input_buffer()
     
     # Send command (no marker, just the command)
@@ -245,12 +255,27 @@ class BoardInfoCollector:
     # Read lines until we see shell prompt
     output_lines = []
     start_time = time.time()
-    timeout = 30.0  # Max 30 seconds per command
+    timeout = 60.0  # Max 60 seconds per command (increased for long outputs)
+    last_output_time = start_time
+    no_output_timeout = 3.0  # If no output for 3 seconds after getting some output, assume command is done
     
     while time.time() - start_time < timeout:
       line = self.read_line(timeout=1.0)
       if line is None:
+        # No line read, check if we've been waiting too long without output
+        elapsed_no_output = time.time() - last_output_time
+        if elapsed_no_output > no_output_timeout and len(output_lines) > 0:
+          # We have some output but nothing new for 3 seconds, check for shell prompt in buffer
+          # Read one more time to catch shell prompt that might be in buffer
+          final_line = self.read_line(timeout=0.5)
+          if final_line and self.PATTERNS["shell_prompt"].search(final_line):
+            self.logger.info(f"Shell prompt detected after no-output timeout, saving output ({len(output_lines)} lines)")
+          else:
+            self.logger.info(f"No new output for {elapsed_no_output:.1f}s, assuming command complete ({len(output_lines)} lines)")
+          break
         continue
+      
+      last_output_time = time.time()  # Update last output time
       
       # Check for shell prompt - if we see it, command is done
       if self.PATTERNS["shell_prompt"].search(line):
@@ -267,6 +292,11 @@ class BoardInfoCollector:
           not re.match(r'^\x1b\[', line.strip())):  # Filter ANSI escape sequences
         output_lines.append(line)
         self.logger.debug(f"Collected output line: {line[:80]}")
+    
+    # Check if we timed out
+    elapsed = time.time() - start_time
+    if elapsed >= timeout:
+      self.logger.warning(f"Command timeout after {elapsed:.1f}s, saving collected output ({len(output_lines)} lines)")
     
     output = "\n".join(output_lines)
     output_size = len(output)
@@ -314,8 +344,30 @@ class BoardInfoCollector:
         self.send_command("", send_ctrl_c=True)
         time.sleep(0.2)
         self.send_command("root", send_ctrl_c=False)
-        # Wait for shell prompt
-        prompt = self.wait_for_prompt(timeout=10.0)
+        self.logger.info("Waiting 5 seconds after login...")
+        time.sleep(5.0)
+        
+        # After 5 seconds, check if shell prompt is already in buffer
+        # Read any available data first (with timeout to avoid blocking)
+        shell_prompt_found = False
+        buffer_check_timeout = time.time() + 2.0  # Check buffer for up to 2 seconds
+        while time.time() < buffer_check_timeout and self.serial_conn.in_waiting > 0:
+          line = self.read_line(timeout=0.1)
+          if line:
+            self.logger.debug(f"Read line after login wait: {line[:100]}")
+            # Check if this line contains shell prompt
+            if self.PATTERNS["shell_prompt"].search(line):
+              color = self.COLORS["PATTERN"]
+              reset = self.COLORS["RESET"]
+              self.logger.info(f"{color}[Pattern]{reset} Matched 'shell_prompt' in buffer: {line}")
+              prompt = "shell_prompt"
+              shell_prompt_found = True
+              break
+        
+        # If not found in buffer, wait for prompt
+        if not shell_prompt_found:
+          prompt = self.wait_for_prompt(timeout=10.0)
+        
         if prompt != "shell_prompt":
           self.logger.error("Failed to get shell prompt after login")
           return False
@@ -369,38 +421,323 @@ class BoardInfoCollector:
     # Generate markdown
     md_lines = ["# Board Information\n"]
     
-    # Table of Contents
+    # Header section with metadata
+    current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    md_lines.append("---\n")
+    md_lines.append(f"**Serial Port:** {self.serial_port}\n")
+    md_lines.append(f"**Date:** {current_datetime}\n")
+    md_lines.append(f"**Script Version:** {self.VERSION}\n")
+    md_lines.append("---\n")
+    md_lines.append("\n")
+    
+    # Table of Contents (with clickable links)
     md_lines.append("## Table of Contents\n")
-    section_order = ["system", "kernel", "hardware", "network", "storage", "debug"]
+    section_order = ["system", "hardware", "storage", "network", "kernel", "debug"]
+    section_titles = {
+      "system": "Operating System",
+      "hardware": "Board Hardware",
+      "storage": "Storage",
+      "network": "Network",
+      "kernel": "Kernel",
+      "debug": "Debug",
+    }
     for section in section_order:
       if section in sections:
-        md_lines.append(f"- [{section.capitalize()}](#{section}-information)")
-    md_lines.append("")
+        # Create anchor link for PDF navigation
+        anchor = section.replace("_", "-")
+        md_lines.append(f"- [{section_titles.get(section, section.capitalize())}](#{anchor}-information)")
+    md_lines.append("\n")
     
     # Content by section
     for section in section_order:
       if section not in sections:
         continue
       
-      md_lines.append(f"## {section.capitalize()} Information\n")
+      # Add anchor for TOC links
+      anchor = section.replace("_", "-")
+      md_lines.append(f"## {section_titles.get(section, section.capitalize())} Information {{#{anchor}-information}}\n")
       
       for title, data in sections[section]:
         md_lines.append(f"### {title}\n")
         md_lines.append(f"**Command:** `{data['command']}`\n")
+        md_lines.append("\n")
         md_lines.append("```\n")
         if data["output"]:
           md_lines.append(data["output"])
         else:
           md_lines.append("(No output)")
         md_lines.append("```\n")
-        md_lines.append("")
+        md_lines.append("\n")
         md_lines.append("---\n")
-        md_lines.append("")
+        md_lines.append("\n")
+    
+    # End of report
+    md_lines.append("---\n")
+    md_lines.append("\n")
+    md_lines.append("## End of Report\n")
+    md_lines.append("\n")
     
     # Write to file
     content = "\n".join(md_lines)
     self.board_info_md.write_text(content, encoding="utf-8")
     self.logger.info(f"Markdown file generated: {self.board_info_md}")
+    
+    # Generate PDF from markdown
+    self.generate_pdf()
+  
+  def _markdown_to_html(self, md_content: str) -> str:
+    """Convert markdown to HTML manually (no markdown module needed)"""
+    import html as html_escape
+    lines = md_content.split('\n')
+    html_lines = []
+    in_code_block = False
+    code_block_lines = []
+    
+    for line in lines:
+      # Code blocks
+      if line.strip().startswith('```'):
+        if in_code_block:
+          # End code block
+          html_lines.append('<pre><code>' + '\n'.join(code_block_lines) + '</code></pre>')
+          code_block_lines = []
+          in_code_block = False
+        else:
+          # Start code block
+          in_code_block = True
+        continue
+      
+      if in_code_block:
+        code_block_lines.append(html_escape.escape(line))
+        continue
+      
+      # Headers
+      if line.startswith('# '):
+        html_lines.append(f'<h1>{html_escape.escape(line[2:].strip())}</h1>')
+      elif line.startswith('## '):
+        # Check for anchor
+        anchor_match = re.search(r'\{#([^}]+)\}', line)
+        if anchor_match:
+          anchor = anchor_match.group(1)
+          text = re.sub(r'\{#[^}]+\}', '', line[3:]).strip()
+          html_lines.append(f'<h2 id="{anchor}">{html_escape.escape(text)}</h2>')
+        else:
+          html_lines.append(f'<h2>{html_escape.escape(line[3:].strip())}</h2>')
+      elif line.startswith('### '):
+        html_lines.append(f'<h3>{html_escape.escape(line[4:].strip())}</h3>')
+      # Horizontal rule
+      elif line.strip() == '---':
+        html_lines.append('<hr>')
+      # Links
+      elif '[' in line and '](' in line:
+        # Simple link: [text](url)
+        line = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', line)
+        html_lines.append(f'<p>{line}</p>')
+      # Bold
+      elif '**' in line:
+        line = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', line)
+        # Inline code
+        line = re.sub(r'`([^`]+)`', r'<code>\1</code>', line)
+        html_lines.append(f'<p>{line}</p>')
+      # Lists
+      elif line.strip().startswith('- '):
+        if not html_lines or html_lines[-1] != '<ul>':
+          html_lines.append('<ul>')
+        item_text = line.strip()[2:]
+        # Handle links in list items
+        item_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', item_text)
+        html_lines.append(f'<li>{item_text}</li>')
+      # Empty line
+      elif not line.strip():
+        if html_lines and html_lines[-1].startswith('<ul>'):
+          html_lines.append('</ul>')
+        html_lines.append('<br>')
+      # Regular paragraph
+      else:
+        # Inline code
+        line = re.sub(r'`([^`]+)`', r'<code>\1</code>', line)
+        html_lines.append(f'<p>{html_escape.escape(line)}</p>')
+    
+    # Close any open lists
+    if html_lines and html_lines[-1].startswith('<li>'):
+      html_lines.append('</ul>')
+    
+    return '\n'.join(html_lines)
+  
+  def generate_pdf(self):
+    """Generate PDF from markdown file using weasyprint or pandoc"""
+    pdf_path = self.board_info_md.with_suffix('.pdf')
+    
+    try:
+      # Try weasyprint first (better control over styling)
+      try:
+        from weasyprint import HTML
+        self.logger.debug("Using weasyprint for PDF generation")
+        
+        # Convert markdown to HTML manually (no markdown module needed)
+        md_content = self.board_info_md.read_text(encoding="utf-8")
+        html_content = self._markdown_to_html(md_content)
+        
+        # Post-process HTML to style commands in red
+        import re as html_re
+        # Style commands in red
+        html_content = html_re.sub(
+          r'<strong>Command:</strong>\s*<code>(.*?)</code>',
+          r'<strong style="color: #d73a49;">Command:</strong> <code style="color: #d73a49; font-weight: 500;">\1</code>',
+          html_content
+        )
+        
+        # GitHub-like CSS styling with Roboto font (fallback to system fonts)
+        css_content = """
+        @page {
+          size: A3 landscape;
+          margin: 1.5cm;
+        }
+        body {
+          font-family: 'Roboto', 'DejaVu Sans', 'Liberation Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+          font-size: 10pt;
+          line-height: 1.5;
+          color: #24292e;
+          background-color: #ffffff;
+        }
+        h1 {
+          font-size: 1.8em;
+          border-bottom: 2px solid #eaecef;
+          padding-bottom: 0.3em;
+          margin-top: 0;
+          margin-bottom: 16px;
+          font-weight: 600;
+        }
+        h2 {
+          font-size: 1.4em;
+          border-bottom: 1px solid #eaecef;
+          padding-bottom: 0.3em;
+          margin-top: 20px;
+          margin-bottom: 12px;
+          font-weight: 600;
+        }
+        h3 {
+          font-size: 1.15em;
+          margin-top: 20px;
+          margin-bottom: 12px;
+          font-weight: 600;
+        }
+        /* Inline code (commands) - red color */
+        p code {
+          font-family: 'Roboto Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Courier New', monospace;
+          background-color: #f6f8fa;
+          padding: 0.15em 0.4em;
+          border-radius: 3px;
+          font-size: 90%;
+        }
+        /* Code blocks (command outputs) - black/white in rectangle */
+        pre {
+          background-color: #f6f8fa;
+          border: 1px solid #d1d5da;
+          border-radius: 6px;
+          padding: 12px;
+          overflow: auto;
+          font-size: 9pt;
+          line-height: 1.4;
+          margin: 8px 0;
+          page-break-inside: avoid;
+        }
+        pre code {
+          font-family: 'Roboto Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Courier New', monospace;
+          background-color: transparent;
+          padding: 0;
+          border: none;
+          color: #24292e;
+          font-weight: normal;
+          white-space: pre;
+          word-wrap: break-word;
+        }
+        ul, ol {
+          padding-left: 2em;
+        }
+        a {
+          color: #0366d6;
+          text-decoration: none;
+        }
+        a:hover {
+          text-decoration: underline;
+        }
+        /* Header section styling */
+        hr {
+          height: 0.25em;
+          padding: 0;
+          margin: 20px 0;
+          background-color: #e1e4e8;
+          border: 0;
+        }
+        hr + p {
+          margin: 8px 0;
+          font-size: 11pt;
+        }
+        table {
+          border-collapse: collapse;
+          width: 100%;
+          margin: 16px 0;
+        }
+        th, td {
+          border: 1px solid #dfe2e5;
+          padding: 6px 13px;
+        }
+        th {
+          background-color: #f6f8fa;
+          font-weight: 600;
+        }
+        """
+        
+        # Wrap HTML with proper structure
+        full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>{css_content}</style>
+</head>
+<body>
+{html_content}
+</body>
+</html>"""
+        
+        # Generate PDF
+        try:
+          HTML(string=full_html).write_pdf(pdf_path)
+          self.logger.info(f"PDF file generated with weasyprint: {pdf_path}")
+          return
+        except Exception as e:
+          self.logger.warning(f"weasyprint PDF generation failed: {e}")
+          raise  # Re-raise to trigger fallback
+        
+      except ImportError as e:
+        self.logger.warning(f"weasyprint not available: {e}")
+        # weasyprint not available, try pandoc (but it won't respect our CSS)
+        try:
+          self.logger.info("Falling back to pandoc (note: CSS styling will not be applied)")
+          result = subprocess.run(
+            ['pandoc', str(self.board_info_md), '-o', str(pdf_path), 
+             '--pdf-engine=xelatex', 
+             '-V', 'mainfont=Roboto',
+             '-V', 'geometry:margin=2cm',
+             '-V', 'papersize=a3paper',
+             '-V', 'geometry:landscape=true'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+          )
+          if result.returncode == 0:
+            self.logger.info(f"PDF file generated with pandoc: {pdf_path}")
+            self.logger.warning("Note: pandoc does not support custom CSS. For full styling, install weasyprint: pip install weasyprint markdown")
+            return
+          else:
+            self.logger.warning(f"pandoc failed: {result.stderr}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+          self.logger.debug(f"pandoc not available: {e}")
+        
+        self.logger.warning("PDF generation skipped: Install 'weasyprint' (pip install weasyprint) for full PDF support with custom styling")
+        
+    except Exception as e:
+      self.logger.warning(f"Failed to generate PDF: {e}")
 
 
 def load_config() -> Dict[str, Any]:

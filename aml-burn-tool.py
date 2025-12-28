@@ -81,11 +81,12 @@ class BurnTool:
     "autoboot": re.compile(r"Hit any key to stop autoboot", re.IGNORECASE),
     # U-Boot prompts: s4_polaris#, a4_mainstream#, a4_ba400#, s6_bl201#, =>, U-Boot>, etc. (NOT root@)
     "uboot_prompt": re.compile(
-      r"(s4_polaris#|a4_mainstream#|a4_ba400#|s6_bl201#|=>|U-Boot>)\s*$", re.MULTILINE
+      r"^(s4_polaris#|a4_mainstream#|a4_ba400#|s6_bl201#|U-Boot>)\s*$|^=>\s*$", re.MULTILINE
     ),
     "login_prompt": re.compile(r"login:\s*$", re.MULTILINE),
     # Shell prompts: root@hostname:~# (Linux shell, NOT U-Boot)
-    "shell_prompt": re.compile(r"root@.*?:\~#\s*$", re.MULTILINE),
+    # Also support Android shell prompt: console:/ $ or console:/#
+    "shell_prompt": re.compile(r"(root@.*?:\~#|console:/.*?\$|console:/.*?#)\s*$", re.MULTILINE),
     "uboot_version": re.compile(r"U-Boot\s+\d+\.\d+", re.IGNORECASE),
     "bl2": re.compile(r"BL2[EX]?\s+.*Built", re.IGNORECASE),
     "bl31": re.compile(r"BL31\s+.*Built|NOTICE:\s+BL31", re.IGNORECASE),
@@ -140,6 +141,8 @@ class BurnTool:
     self.first_data_timeout = 30  # 30 seconds timeout for first data
     self.last_line_time = None  # Timestamp of last received line
     self.boot_verify_sent = False  # Track if uname -a sent
+    self.boot_verify_enter_sent = False  # Track if Enter sent to wake up shell prompt
+    self.boot_verify_kernel_seen = False  # Track if kernel boot message seen
     self.prompt_wake_attempts = 0  # Track wake-up attempts when waiting for prompt
     # Board info collection
     self.board_info_uname_received = False  # Track if uname -a output received
@@ -155,6 +158,14 @@ class BurnTool:
     self.continuous_enter_task = None  # Task for continuous Enter sending
     self.stop_enter_sending = False  # Flag to stop Enter sending
     self.uboot_prompt_seen_after_reboot = False  # Track if U-Boot prompt seen after reboot
+    self.boot_verify_enter_task = None  # Task to send Enter after kernel boot
+    # U-Boot detection via version command
+    self.recent_lines_buffer = []  # Buffer to store last 20 lines for repeated prompt detection
+    self.recent_lines_buffer_size = 20  # Number of recent lines to track
+    self.version_command_sent = False  # Track if version command was sent
+    self.version_response_buffer = []  # Buffer to collect version command response
+    self.version_response_timeout = 3.0  # Timeout for version command response (seconds)
+    self.version_response_start_time = None  # Timestamp when version command was sent
 
   def setup_logging(self):
     """Setup logging to script log file"""
@@ -367,18 +378,26 @@ class BurnTool:
     self.serial_conn.write(b"\r")  # Enter
     time.sleep(0.2)
     
-    # Step 3: Send reset command to clear any state
+    # Step 3: Send reset command to clear any state (Linux only, Android will ignore)
     self.serial_conn.write(b"reset\r")
     time.sleep(0.3)
     
-    # Step 4: Send reboot -f
-    self.send_serial_command("reboot -f", delay=0.002)
+    # Step 4: Send reboot -f ; reboot (works on both Linux and Android)
+    # Linux: reboot -f works, reboot is ignored (already rebooting)
+    # Android: reboot -f fails but ; continues, reboot works
+    self.send_serial_command("reboot -f ; reboot", delay=0.002)
     time.sleep(0.1)
 
-  async def send_continuous_enter(self):
-    """Send Enter continuously (every 1ms) to catch autoboot"""
-    self.logger.info("Starting continuous Enter sending (1ms interval)")
+  async def send_continuous_enter(self, timeout: float = 10.0):
+    """Send Enter continuously (every 1ms) to catch autoboot
+    
+    Args:
+      timeout: Maximum time to send Enter (default: 10 seconds)
+               If timeout is reached and prompt is not detected, raises error
+    """
+    self.logger.info(f"Starting continuous Enter sending (1ms interval, timeout: {timeout}s)")
     enter_count = 0
+    start_time = time.time()
     
     # Send first Enter immediately (before async sleep) to catch autoboot as fast as possible
     if self.serial_conn and self.serial_conn.is_open:
@@ -391,18 +410,41 @@ class BurnTool:
     
     while not self.stop_enter_sending and self.serial_conn and self.serial_conn.is_open:
       try:
+        # Check timeout
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+          # Timeout reached - check if prompt was detected
+          if not self.stop_enter_sending:
+            # Prompt was not detected, this is an error
+            self.logger.error(
+              f"Timeout ({timeout}s) reached while sending continuous Enter. "
+              f"U-Boot prompt was not detected. Total Enter commands sent: {enter_count}"
+            )
+            # Stop sending and raise error
+            self.stop_enter_sending = True
+            self.change_state(State.ERROR, f"Failed to detect U-Boot prompt after {timeout}s of continuous Enter sending")
+            return
+          else:
+            # Prompt was detected, just exit normally
+            break
+        
         await asyncio.sleep(0.001)  # 1ms = 0.001 seconds
         if self.stop_enter_sending:
           break
         self.serial_conn.write(b"\r")
         enter_count += 1
         if enter_count % 100 == 0:  # Log every 100 Enter
-          self.logger.debug(f"Sent {enter_count} Enter commands")
+          elapsed = time.time() - start_time
+          self.logger.debug(f"Sent {enter_count} Enter commands (elapsed: {elapsed:.1f}s)")
       except Exception as e:
         self.logger.error(f"Error sending continuous Enter: {e}")
         break
     
-    self.logger.info(f"Stopped continuous Enter sending (total: {enter_count} Enter commands)")
+    elapsed = time.time() - start_time
+    if self.stop_enter_sending:
+      self.logger.info(f"Stopped continuous Enter sending (total: {enter_count} Enter commands, elapsed: {elapsed:.1f}s)")
+    else:
+      self.logger.warning(f"Continuous Enter sending ended unexpectedly (total: {enter_count} Enter commands, elapsed: {elapsed:.1f}s)")
 
   def change_state(self, new_state: State, reason: str = ""):
     """Change FSM state and log transition"""
@@ -416,16 +458,46 @@ class BurnTool:
         f"{color}[FSM]{reset} State transition: {self.state.value} -> {new_state.value} "
         f"({reason}) [elapsed: {elapsed:.1f}s, lines: {self.lines_received}]"
       )
+      old_state = self.state
       self.state = new_state
       self.last_activity = timestamp
 
       # Reset flags when going back to INIT
       if new_state == State.INIT:
         self.reboot_sent = False
+        # Reset version detection state when going back to INIT
+        self.version_command_sent = False
+        self.version_response_buffer = []
+        self.version_response_start_time = None
+        self.recent_lines_buffer = []
       
       # Reset prompt wake attempts when state changes (prompt was detected)
       if new_state != State.INIT:
         self.prompt_wake_attempts = 0
+        # Clear recent lines buffer when state changes (we're making progress)
+        self.recent_lines_buffer = []
+      
+      # If transitioning to UBOOT state and adnl hasn't been sent yet,
+      # start adnl_burn_pkg and send adnl command automatically
+      # This handles the case where board is already at U-Boot prompt when script starts
+      if new_state == State.UBOOT and not self.adnl_sent:
+        async def start_adnl_after_uboot_transition():
+          # Small delay to ensure state transition is complete
+          await asyncio.sleep(0.1)
+          if self.state == State.UBOOT and not self.adnl_sent:
+            self.logger.info("U-Boot state detected, starting adnl_burn_pkg and sending adnl command...")
+            # Start adnl_burn_pkg first
+            if self.adnl_process is None:
+              self.adnl_task = asyncio.create_task(self.run_adnl_burn_pkg())
+              await asyncio.sleep(0.5)  # Allow process to start
+            # Send adnl command
+            self.send_serial_command("adnl")
+            self.logger.info("Sent 'adnl' command to enter download mode")
+            self.adnl_sent = True
+            self.change_state(State.DOWNLOAD, "Entered download mode")
+        
+        # Start async task to send adnl after state transition
+        asyncio.create_task(start_adnl_after_uboot_transition())
 
   def match_pattern(self, line: str) -> Optional[str]:
     """Match line against known patterns, return pattern name"""
@@ -433,6 +505,91 @@ class BurnTool:
       if pattern.search(line):
         return pattern_name
     return None
+  
+  def _check_repeated_prompt(self, line: str) -> bool:
+    """Check if the same prompt appears 20 times in recent lines"""
+    # Normalize line: strip whitespace
+    stripped_line = line.strip()
+    if not stripped_line:
+      return False  # Skip empty lines
+    
+    # If version command already sent, don't check again (avoid spam)
+    if self.version_command_sent:
+      return False
+    
+    self.recent_lines_buffer.append(stripped_line)
+    # Keep only last N lines
+    if len(self.recent_lines_buffer) > self.recent_lines_buffer_size:
+      self.recent_lines_buffer.pop(0)
+    
+    # Need at least 20 lines
+    if len(self.recent_lines_buffer) < self.recent_lines_buffer_size:
+      return False
+    
+    # Check if all last 20 lines are the same
+    first_line = self.recent_lines_buffer[0]
+    all_same = all(l == first_line for l in self.recent_lines_buffer)
+    
+    if all_same:
+      # All lines are the same - likely a repeated prompt
+      self.logger.info(f"Repeated prompt detected: '{first_line}' appears {len(self.recent_lines_buffer)} times")
+      return True
+    
+    # Debug: log when buffer is full but lines differ
+    if len(self.recent_lines_buffer) == self.recent_lines_buffer_size:
+      unique_lines = set(self.recent_lines_buffer)
+      if len(unique_lines) <= 3:  # Only a few unique lines
+        self.logger.debug(f"Buffer full but not all same: {len(unique_lines)} unique lines. First: '{first_line}', Last: '{self.recent_lines_buffer[-1]}'")
+    
+    return False
+  
+  async def _detect_uboot_by_version(self):
+    """Send version command to detect if we're in U-Boot"""
+    if self.version_command_sent:
+      return  # Already sent, don't send again
+    
+    self.logger.info("Repeated prompt detected (20x), sending 'version' command to detect U-Boot...")
+    self.send_serial_command("version")
+    self.version_command_sent = True
+    self.version_response_start_time = time.time()
+    self.version_response_buffer = []
+  
+  def _check_version_response(self, line: str) -> bool:
+    """Check if version command response indicates U-Boot"""
+    if not self.version_command_sent:
+      return False
+    
+    # Collect response lines
+    self.version_response_buffer.append(line)
+    
+    # Check timeout
+    if self.version_response_start_time:
+      elapsed = time.time() - self.version_response_start_time
+      if elapsed > self.version_response_timeout:
+        # Timeout - check collected response
+        response_text = " ".join(self.version_response_buffer)
+        if "U-Boot" in response_text:
+          self.logger.info("U-Boot detected via 'version' command response")
+          return True
+        else:
+          self.logger.debug("'version' command response does not indicate U-Boot")
+          # Reset for next attempt
+          self.version_command_sent = False
+          self.version_response_buffer = []
+          self.version_response_start_time = None
+          return False
+    
+    # Check if we have enough response (look for U-Boot in collected lines)
+    response_text = " ".join(self.version_response_buffer)
+    if "U-Boot" in response_text:
+      self.logger.info("U-Boot detected via 'version' command response")
+      # Reset for next attempt
+      self.version_command_sent = False
+      self.version_response_buffer = []
+      self.version_response_start_time = None
+      return True
+    
+    return False
 
   async def read_serial_async(self):
     """Async serial port reader"""
@@ -558,12 +715,70 @@ class BurnTool:
     # Reset wake-up attempts counter when we receive any data
     self.prompt_wake_attempts = 0
 
+    # Check for version command response (before pattern matching)
+    if self.version_command_sent:
+      if self._check_version_response(line):
+        # U-Boot detected via version command
+        if self.state == State.INIT or self.state == State.UBOOT:
+          if self.state == State.INIT:
+            self.change_state(State.UBOOT, "U-Boot detected via 'version' command")
+          # Reset version detection state
+          self.version_command_sent = False
+          self.version_response_buffer = []
+          self.version_response_start_time = None
+          self.recent_lines_buffer = []  # Clear buffer after successful detection
+          # Since we detected U-Boot via version command, we're at U-Boot prompt
+          # Send adnl command directly if not already sent
+          if not self.adnl_sent:
+            self.logger.info("U-Boot detected via version command, sending 'adnl' command to enter download mode")
+            # CRITICAL: Stop continuous Enter sending before sending adnl command
+            # Otherwise Enter characters will interfere with adnl command
+            if self.continuous_enter_task and not self.continuous_enter_task.done():
+              self.stop_enter_sending = True
+              self.logger.info("Stopping continuous Enter before sending adnl command...")
+              # Wait a bit for the task to stop (max 100ms)
+              try:
+                await asyncio.wait_for(self.continuous_enter_task, timeout=0.1)
+              except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+              await asyncio.sleep(0.05)  # Small delay to ensure Enter sending stopped
+            # Transition to DOWNLOAD state
+            self.change_state(State.DOWNLOAD, "U-Boot detected via version command, entering download mode")
+            # Start adnl_burn_pkg as async task first (for all boards)
+            if self.adnl_process is None:
+              self.adnl_task = asyncio.create_task(self.run_adnl_burn_pkg())
+              await asyncio.sleep(0.5)  # Allow process to start
+            # Send adnl command
+            self.send_serial_command("adnl")
+            self.adnl_sent = True
+
     # Pattern matching
     pattern = self.match_pattern(line)
     if pattern:
       color = self.COLORS["PATTERN"]
       reset = self.COLORS["RESET"]
       self.logger.info(f"{color}[Pattern]{reset} Matched '{pattern}' in: {line[:100]}")
+      # If pattern matched, clear recent lines buffer (we're making progress)
+      if pattern in ["uboot_prompt", "shell_prompt", "login_prompt"]:
+        self.recent_lines_buffer = []
+        self.version_command_sent = False
+        self.version_response_buffer = []
+        self.version_response_start_time = None
+
+    # Check for repeated prompt in INIT or UBOOT state (fallback U-Boot detection)
+    # This handles cases where we're at a U-Boot prompt but pattern doesn't match
+    if (self.state == State.INIT or self.state == State.UBOOT) and not pattern:
+      # No pattern matched, check for repeated prompt
+      is_repeated = self._check_repeated_prompt(line)
+      if is_repeated:
+        # Same prompt repeated 20 times - try version command detection
+        if not self.version_command_sent:
+          self.logger.info(f"Repeated prompt detected in {self.state.value} state, triggering version command detection")
+          await self._detect_uboot_by_version()
+      # Debug: log buffer status every 50 lines when buffer is full
+      elif len(self.recent_lines_buffer) >= 20 and self.lines_received % 50 == 0:
+        unique_lines = set(self.recent_lines_buffer)
+        self.logger.info(f"[DEBUG] State={self.state.value}, Buffer has {len(self.recent_lines_buffer)} lines, {len(unique_lines)} unique. First: '{self.recent_lines_buffer[0] if self.recent_lines_buffer else 'N/A'}', Last: '{self.recent_lines_buffer[-1] if self.recent_lines_buffer else 'N/A'}'")
 
     # State machine logic
     if self.state == State.INIT:
@@ -584,6 +799,11 @@ class BurnTool:
           await asyncio.sleep(5.0)
           self.change_state(State.LOGIN, "Login sent")
       elif pattern == "shell_prompt":
+        # Disable kernel messages first
+        # Use echo to /proc/sys/kernel/printk (works on both Linux and Android with root)
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk 2>/dev/null')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
         # Already booted to Linux - send reboot immediately and stay in INIT
         if not self.reboot_sent:
           self.send_robust_reboot()
@@ -595,12 +815,32 @@ class BurnTool:
           self.uboot_prompt_seen_after_reboot = False
           self.stop_enter_sending = False
           # Stay in INIT state (rebooting)
-          self.logger.info("Board rebooting, waiting for bootloader stages...")
-      # After reboot, detect bootloader stages and start continuous Enter
-      if self.reboot_sent and (pattern == "bl2" or pattern == "bl31" or pattern == "bl32"):
+          # Do NOT start continuous Enter here - wait for BL2 stage to be detected
+          # Continuous Enter will start when BL31 stage is detected (see below)
+          self.logger.info("Board rebooting, waiting for BL31 stage to start continuous Enter...")
+      # Handle U-Boot prompt in INIT state (if continuous Enter is running)
+      if pattern == "uboot_prompt":
+        # Stop continuous Enter sending (if running)
+        if self.continuous_enter_task and not self.continuous_enter_task.done():
+          self.stop_enter_sending = True
+          self.logger.info("U-Boot prompt detected in INIT state, stopping continuous Enter sending...")
+          # Wait a bit for the task to stop (max 100ms)
+          try:
+            await asyncio.wait_for(self.continuous_enter_task, timeout=0.1)
+          except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+          await asyncio.sleep(0.05)  # Small delay to ensure Enter sending stopped
+        # Transition to UBOOT state to handle adnl command
+        if not self.adnl_sent:
+          self.change_state(State.UBOOT, "U-Boot prompt detected in INIT state")
+      
+      # Start continuous Enter when BL31 stage is detected
+      # This is the PRIMARY way to catch autoboot after reboot
+      # Only if continuous Enter is not already running
+      if self.reboot_sent and pattern == "bl31":
         if not self.continuous_enter_task or self.continuous_enter_task.done():
           self.logger.info(
-            f"Bootloader stage detected ({pattern}), starting continuous Enter to catch autoboot"
+            f"BL31 stage detected, starting continuous Enter to catch autoboot (15s timeout)"
           )
           # Send first Enter IMMEDIATELY (synchronously) before starting async task
           # This is critical to catch autoboot which has 0 delay
@@ -613,17 +853,21 @@ class BurnTool:
           self.stop_enter_sending = False
           self.uboot_prompt_seen_after_reboot = False
           self.continuous_enter_task = asyncio.create_task(
-            self.send_continuous_enter()
+            self.send_continuous_enter(timeout=15.0)
           )
+        else:
+          # Continuous Enter already running, just log
+          self.logger.debug(f"BL31 stage detected, but continuous Enter already running")
 
     elif self.state == State.BOOTROM:
       if pattern == "uboot_version":
         self.change_state(State.UBOOT, "U-Boot detected")
-      # After reboot, detect bootloader stages and start continuous Enter
-      if self.reboot_sent and (pattern == "bl2" or pattern == "bl31" or pattern == "bl32"):
+      # After reboot, detect BL31 stage and start continuous Enter
+      # Only if continuous Enter is not already running
+      if self.reboot_sent and pattern == "bl31":
         if not self.continuous_enter_task or self.continuous_enter_task.done():
           self.logger.info(
-            f"Bootloader stage detected ({pattern}), starting continuous Enter to catch autoboot"
+            f"BL31 stage detected, starting continuous Enter to catch autoboot (15s timeout)"
           )
           # Send first Enter IMMEDIATELY (synchronously) before starting async task
           # This is critical to catch autoboot which has 0 delay
@@ -636,8 +880,11 @@ class BurnTool:
           self.stop_enter_sending = False
           self.uboot_prompt_seen_after_reboot = False
           self.continuous_enter_task = asyncio.create_task(
-            self.send_continuous_enter()
+            self.send_continuous_enter(timeout=15.0)
           )
+        else:
+          # Continuous Enter already running, just log
+          self.logger.debug(f"BL31 stage detected, but continuous Enter already running")
 
     elif self.state == State.UBOOT:
       if pattern == "autoboot":
@@ -646,16 +893,28 @@ class BurnTool:
         self.logger.info("Sent Enter to stop autoboot")
       elif pattern == "uboot_prompt":
         # U-Boot prompt detected
-        if self.reboot_sent and not self.uboot_prompt_seen_after_reboot:
-          # After reboot, stop continuous Enter sending
+        # Stop continuous Enter sending (if running)
+        if self.continuous_enter_task and not self.continuous_enter_task.done():
           self.stop_enter_sending = True
+          self.logger.info("U-Boot prompt detected, stopping continuous Enter sending...")
+          # Wait a bit for the task to stop (max 100ms)
+          try:
+            await asyncio.wait_for(self.continuous_enter_task, timeout=0.1)
+          except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+          await asyncio.sleep(0.05)  # Small delay to ensure Enter sending stopped
+        
+        if self.reboot_sent and not self.uboot_prompt_seen_after_reboot:
           self.uboot_prompt_seen_after_reboot = True
-          self.logger.info(
-            "U-Boot prompt detected after reboot, stopped continuous Enter sending"
-          )
         
         if not self.adnl_sent:
-          # We're at U-Boot prompt, send adnl command (only once)
+          # We're at U-Boot prompt
+          # CRITICAL: Start adnl_burn_pkg FIRST, then send adnl command (for all boards)
+          # This ensures the burn process is ready before the board enters download mode
+          if self.adnl_process is None:
+            self.adnl_task = asyncio.create_task(self.run_adnl_burn_pkg())
+            await asyncio.sleep(0.5)  # Allow process to start
+          # Now send adnl command
           self.send_serial_command("adnl")
           self.logger.info("Sent 'adnl' command to enter download mode")
           self.adnl_sent = True
@@ -674,6 +933,11 @@ class BurnTool:
           # Already sent login, just transition to LINUX state
           self.change_state(State.LINUX, "Linux login detected")
       elif pattern == "shell_prompt":
+        # Disable kernel messages first
+        # Use echo to /proc/sys/kernel/printk (works on both Linux and Android with root)
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk 2>/dev/null')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
         # Board booted to Linux shell (autoboot wasn't caught)
         # Send reboot immediately to start over
         if not self.reboot_sent:
@@ -691,12 +955,72 @@ class BurnTool:
       # Wait for adnl_burn_pkg to complete
       if pattern == "usb_reset":
         self.logger.info("USB download mode active")
+      elif pattern == "uboot_prompt":
+        # U-Boot prompt detected in DOWNLOAD state (shouldn't happen normally, but handle it)
+        # Stop continuous Enter sending (if running)
+        if self.continuous_enter_task and not self.continuous_enter_task.done():
+          self.stop_enter_sending = True
+          self.logger.info("U-Boot prompt detected in DOWNLOAD state, stopping continuous Enter sending...")
+          # Wait a bit for the task to stop (max 100ms)
+          try:
+            await asyncio.wait_for(self.continuous_enter_task, timeout=0.1)
+          except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+          await asyncio.sleep(0.05)  # Small delay to ensure Enter sending stopped
+        # If adnl hasn't been sent yet, send it now
+        if not self.adnl_sent:
+          self.logger.warning("U-Boot prompt detected in DOWNLOAD state but adnl not sent yet, sending now...")
+          # CRITICAL: Start adnl_burn_pkg FIRST, then send adnl command (for all boards)
+          if self.adnl_process is None:
+            self.adnl_task = asyncio.create_task(self.run_adnl_burn_pkg())
+            await asyncio.sleep(0.5)  # Allow process to start
+          # Now send adnl command
+          self.send_serial_command("adnl")
+          self.logger.info("Sent 'adnl' command to enter download mode")
+          self.adnl_sent = True
       elif pattern == "rebooting":
         # Board rebooting after burn - this is expected, continue monitoring
         self.logger.info("Board rebooting after burn, monitoring boot sequence...")
+        # Set flags to catch autoboot after reboot
+        self.reboot_sent = True
+        self.uboot_prompt_seen_after_reboot = False
+        self.stop_enter_sending = False
+        self.login_sent = False
+        self.adnl_sent = False
 
     elif self.state == State.BOOT_VERIFY:
       # After burn, monitor boot and verify successful boot
+      # IMPORTANT: After burn, we want the board to boot to Linux automatically
+      # We should NOT catch autoboot - let it boot normally to Linux
+      # After reboot, detect bootloader stages but DO NOT send Enter to catch autoboot
+      # Just monitor and wait for Linux to boot
+      if self.reboot_sent and (pattern == "bl2" or pattern == "bl31" or pattern == "bl32"):
+        self.logger.info(
+          f"Bootloader stage detected ({pattern}) after burn, waiting for Linux boot (not catching autoboot)"
+        )
+      # After reboot, when U-Boot prompt is detected, just log it and continue waiting for Linux
+      # DO NOT stop autoboot - let it continue to Linux
+      if self.reboot_sent and pattern == "uboot_prompt":
+        self.uboot_prompt_seen_after_reboot = True
+        self.logger.info("U-Boot prompt detected after burn, waiting for autoboot to continue to Linux...")
+      
+      # Detect kernel boot message - after this, we can send Enter to wake up shell prompt
+      if "Linux version" in line and not self.boot_verify_kernel_seen:
+        self.boot_verify_kernel_seen = True
+        self.logger.info("Kernel boot message detected, will send Enter after 5 seconds to wake up shell prompt")
+        # Start async task to send Enter after delay
+        if not self.boot_verify_enter_task or self.boot_verify_enter_task.done():
+          async def send_enter_after_delay():
+            await asyncio.sleep(5.0)  # Wait 5 seconds for system to fully boot
+            if self.serial_conn and self.serial_conn.is_open and not self.boot_verify_enter_sent and not self.boot_verify_sent:
+              try:
+                self.serial_conn.write(b"\r")
+                self.logger.info("Sent Enter to wake up shell prompt after kernel boot")
+                self.boot_verify_enter_sent = True
+              except Exception as e:
+                self.logger.error(f"Error sending Enter to wake up shell prompt: {e}")
+          self.boot_verify_enter_task = asyncio.create_task(send_enter_after_delay())
+      
       # Don't send any commands during bootloader stages, just monitor
       if pattern == "login_prompt" and not self.login_sent:
         # Login prompt detected, send root
@@ -706,19 +1030,23 @@ class BurnTool:
         self.logger.info("Waiting 5 seconds after login...")
         await asyncio.sleep(5.0)
       elif pattern == "shell_prompt" and not self.boot_verify_sent:
-        # Shell prompt detected, send uname -a to verify boot
+        # Disable kernel messages first
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
+        # Shell prompt detected (Linux or Android), send uname -a to verify boot
         self.send_serial_command("uname -a")
         self.logger.info("Sent 'uname -a' to verify successful boot")
         self.boot_verify_sent = True
       
-      # Check if line contains kernel version (uname -a output)
-      # Look for Linux kernel version string
+      # Check if line contains kernel version (from uname -a output only)
+      # Wait for shell prompt, send uname -a, then verify kernel version from response
       if self.boot_verify_sent and not self.board_info_uname_received and (
         "Linux" in line
         and ("#1" in line or "SMP" in line or "PREEMPT" in line or "GNU/Linux" in line)
       ):
-        # Kernel version detected, boot successful - now collect board info
-        self.logger.info(f"Kernel version detected: {line[:100]}")
+        # Kernel version detected from uname -a output
+        self.logger.info(f"Kernel version detected from uname -a: {line[:100]}")
         self.board_info_uname_received = True
         self.logger.info("Boot verified successfully, calling collect_board_info.py")
         # Call external collect_board_info.py script
@@ -735,6 +1063,11 @@ class BurnTool:
         await asyncio.sleep(5.0)
         self.change_state(State.LOGIN, "Login sent")
       elif pattern == "shell_prompt":
+        # Disable kernel messages first
+        # Use echo to /proc/sys/kernel/printk (works on both Linux and Android with root)
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk 2>/dev/null')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
         if not self.reboot_sent:
           # Logged in, send reboot to go back to U-Boot
           self.send_robust_reboot()
@@ -752,6 +1085,10 @@ class BurnTool:
       # Also check for shell_prompt even if we just transitioned to LINUX
       # This handles the case where we transitioned from INIT to LINUX in the same line
       if pattern == "shell_prompt" and not self.reboot_sent:
+        # Disable kernel messages first
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
         # Send reboot immediately
         self.send_robust_reboot()
         self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f) (immediate)")
@@ -765,6 +1102,10 @@ class BurnTool:
 
     elif self.state == State.LOGIN:
       if pattern == "shell_prompt":
+        # Disable kernel messages first
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
         if not self.reboot_sent:
           # Logged in successfully, send reboot
           self.send_robust_reboot()
@@ -778,6 +1119,10 @@ class BurnTool:
       # Also check for shell_prompt even if we just transitioned to LOGIN
       # This handles the case where we transitioned from INIT to LOGIN in the same line
       if pattern == "shell_prompt" and not self.reboot_sent:
+        # Disable kernel messages first
+        self.send_serial_command('echo "0 0 0 0" > /proc/sys/kernel/printk')
+        self.logger.info("Disabled kernel messages (printk)")
+        await asyncio.sleep(0.2)
         # Send reboot immediately
         self.send_robust_reboot()
         self.logger.info("Sent robust reboot sequence (Ctrl+C, reset, reboot -f) (immediate)")
@@ -1095,10 +1440,17 @@ class BurnTool:
           if "burn successful" in line.lower() or "burn successful^_^" in line:
             self.logger.info("Burn successful! Waiting for board to reboot and boot...")
             self.burn_complete_time = time.time()
-            # Reset login flag for post-burn login
+            # Reset flags for post-burn boot verification
             self.login_sent = False
             self.boot_verify_sent = False
+            self.adnl_sent = False
+            # Set reboot_sent flag to enable autoboot catching after reboot
+            self.reboot_sent = True
+            self.uboot_prompt_seen_after_reboot = False
+            self.stop_enter_sending = False
             self.change_state(State.BOOT_VERIFY, "Burn completed, verifying boot")
+            # Start task to actively wake up shell prompt after reboot
+            asyncio.create_task(self._wake_up_shell_after_burn())
             break
 
       # Wait for process to complete
@@ -1112,6 +1464,49 @@ class BurnTool:
     except Exception as e:
       self.logger.error(f"Error running adnl_burn_pkg: {e}")
       self.change_state(State.ERROR, f"adnl_burn_pkg error: {e}")
+
+  async def _wake_up_shell_after_burn(self):
+    """Wake up shell prompt after burn by sending Enter and handling login if needed"""
+    self.logger.info("Starting shell wake-up task after burn (waiting 10 seconds first)...")
+    
+    # Wait 10 seconds after burn completes
+    await asyncio.sleep(10.0)
+    
+    if self.state != State.BOOT_VERIFY:
+      self.logger.debug("State changed, aborting shell wake-up task")
+      return
+    
+    self.logger.info("Sending Enter to wake up shell prompt...")
+    
+    # Step 1: Send Enter
+    if self.serial_conn and self.serial_conn.is_open:
+      try:
+        self.serial_conn.write(b"\r")
+        await asyncio.sleep(1.0)  # Wait 1 second for response
+        
+        # Check if we got login_prompt or shell_prompt (this will be handled by process_serial_line)
+        # If nothing came, continue to step 2
+        
+        # Step 2: Send Enter again, if nothing comes, send Ctrl+C then Enter
+        self.logger.info("Sending Enter again...")
+        self.serial_conn.write(b"\r")
+        await asyncio.sleep(1.0)  # Wait 1 second for response
+        
+        # If still no response, send Ctrl+C then Enter
+        if self.state == State.BOOT_VERIFY and not self.boot_verify_sent:
+          self.logger.info("No response, sending Ctrl+C then Enter...")
+          self.serial_conn.write(b"\x03")  # Ctrl+C
+          await asyncio.sleep(0.2)
+          self.serial_conn.write(b"\r")  # Enter
+          await asyncio.sleep(1.0)  # Wait 1 second for response
+          
+          # Step 3: If still no shell prompt, try one more Enter
+          if self.state == State.BOOT_VERIFY and not self.boot_verify_sent:
+            self.logger.info("Sending final Enter...")
+            self.serial_conn.write(b"\r")
+            await asyncio.sleep(1.0)
+      except Exception as e:
+        self.logger.error(f"Error in shell wake-up task: {e}")
 
   async def monitor_timeout(self):
     """Monitor for timeout conditions"""
@@ -1306,45 +1701,65 @@ class BurnTool:
         self.uboot_prompt_seen_after_reboot = False
         self.stop_enter_sending = False
         
-        # Start sending Enter immediately after power ON
-        # Send Enter every 0.5 seconds for up to 10 seconds
-        enter_timeout = 10.0
-        enter_interval = 0.5
-        start_time = time.time()
-        enter_count = 0
-        last_log_time = start_time
-        
-        self.logger.info(f"Sending Enter every {enter_interval}s for up to {enter_timeout}s to catch autoboot...")
-        
-        while (time.time() - start_time) < enter_timeout:
+        # Start continuous Enter immediately after power ON (10 second timeout)
+        # This will catch autoboot when BL2 stage is reached
+        self.logger.info("Starting continuous Enter to catch autoboot after power cycle (10s timeout)...")
+        if not self.continuous_enter_task or self.continuous_enter_task.done():
+          # Send first Enter IMMEDIATELY (synchronously) before starting async task
           if self.serial_conn and self.serial_conn.is_open:
             try:
               self.serial_conn.write(b"\r")
-              enter_count += 1
-              current_time = time.time()
-              # Log every 0.5 seconds
-              if (current_time - last_log_time) >= enter_interval:
-                elapsed = current_time - start_time
-                self.logger.info(f"Sending Enter... ({elapsed:.1f}s / {enter_timeout}s)")
-                last_log_time = current_time
+              self.logger.debug("Sent immediate Enter to catch autoboot (after power cycle)")
             except Exception as e:
-              self.logger.error(f"Error sending Enter: {e}")
+              self.logger.error(f"Error sending immediate Enter: {e}")
+          self.continuous_enter_task = asyncio.create_task(
+            self.send_continuous_enter(timeout=15.0)
+          )
+        
+        # Wait for U-Boot prompt to be detected (or timeout)
+        # Check every 0.5 seconds
+        start_time = time.time()
+        timeout = 12.0  # Slightly longer than continuous Enter timeout to allow for detection
+        while (time.time() - start_time) < timeout:
+          # CRITICAL: Check if burn process has started - if so, abort power cycle retry
+          if self.state == State.DOWNLOAD and self.adnl_process is not None:
+            if self.adnl_process.returncode is None:
+              self.logger.warning("Burn process detected during power cycle retry, aborting retry to avoid interrupting burn")
+              autoboot_caught = True
               break
           
-          await asyncio.sleep(enter_interval)
-          
-          # Check if U-Boot prompt was detected
-          if self.uboot_prompt_seen_after_reboot:
-            elapsed = time.time() - start_time
-            self.logger.info(f"U-Boot prompt detected after {elapsed:.1f}s, autoboot caught!")
+          # Check if U-Boot prompt was detected (via pattern matching in process_serial_line)
+          if self.uboot_prompt_seen_after_reboot or self.state == State.UBOOT:
+            self.logger.info("U-Boot prompt detected, autoboot caught!")
             autoboot_caught = True
             break
+          
+          # Check if continuous Enter task completed (timeout or stopped)
+          if self.continuous_enter_task and self.continuous_enter_task.done():
+            # Task completed - check if it was due to timeout (ERROR state) or success
+            if self.state == State.ERROR:
+              # Timeout occurred, U-Boot prompt was not detected
+              self.logger.error("Continuous Enter timeout: U-Boot prompt was not detected after power cycle")
+              autoboot_caught = False
+              break
+            elif self.stop_enter_sending:
+              # Task stopped normally (prompt detected)
+              autoboot_caught = True
+              break
+          
+          await asyncio.sleep(0.5)
         
         # Check if we successfully caught autoboot
         if autoboot_caught:
           self.logger.info("Autoboot successfully caught, continuing...")
           break
         else:
+          # Before retrying, check if burn process has started
+          if self.state == State.DOWNLOAD and self.adnl_process is not None:
+            if self.adnl_process.returncode is None:
+              self.logger.warning("Burn process detected, aborting power cycle retry to avoid interrupting burn")
+              break  # Exit retry loop, let burn continue
+          
           elapsed = time.time() - start_time
           self.logger.warning(f"Autoboot not caught after {elapsed:.1f}s (attempt {attempt}/{max_attempts})")
           if attempt < max_attempts:

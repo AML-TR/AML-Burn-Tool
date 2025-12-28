@@ -55,7 +55,8 @@ class BoardInfoCollector:
   # Pattern definitions
   PATTERNS = {
     "login_prompt": re.compile(r"login:\s*$", re.MULTILINE),
-    "shell_prompt": re.compile(r"root@.*?:\~#\s*$"),  # Removed MULTILINE, match anywhere in string
+    # Shell prompts: root@hostname:~# (Linux) or console:/ $ (Android)
+    "shell_prompt": re.compile(r"(root@.*?:\~#|console:/.*?\$|console:/.*?#)\s*$"),  # Removed MULTILINE, match anywhere in string
     "uboot_prompt": re.compile(
       r"(s4_polaris#|a4_mainstream#|a4_ba400#|=>|U-Boot>)\s*$", re.MULTILINE
     ),
@@ -90,33 +91,20 @@ class BoardInfoCollector:
     # Setup logging
     self.setup_logging()
     
-    # Board info collection - hierarchical order:
-    # 1. Operating System (os-release, version, hostname)
-    # 2. Board Hardware (CPU, Memory, Disk, Network)
-    # 3. Kernel (uname, lsmod, config, device-tree)
-    self.commands = [
-      # Operating System Information
-      {"cmd": "cat /etc/os-release", "section": "system", "title": "OS Release Information"},
-      {"cmd": "cat /etc/version", "section": "system", "title": "Version Information"},
-      {"cmd": "hostname", "section": "system", "title": "Hostname"},
-      # Board Hardware Information
-      {"cmd": "cat /proc/cpuinfo", "section": "hardware", "title": "CPU Information"},
-      {"cmd": "cat /proc/meminfo", "section": "hardware", "title": "Memory Information"},
-      {"cmd": "df -h", "section": "storage", "title": "Filesystem Usage"},
-      {"cmd": "mount", "section": "storage", "title": "Mounted Filesystems"},
-      {"cmd": "fdisk -l", "section": "storage", "title": "Partition Table"},
-      {"cmd": "ip a", "section": "network", "title": "Network Interfaces"},
-      # Kernel Information
-      {"cmd": "uname -a", "section": "kernel", "title": "Kernel Information"},
-      {"cmd": "lsmod", "section": "kernel", "title": "Loaded Kernel Modules"},
-      {"cmd": "zcat /proc/config.gz", "section": "kernel", "title": "Kernel Configuration"},
-      {"cmd": "find /proc/device-tree/", "section": "kernel", "title": "Device Tree"},
-      # Debug Information
-      {"cmd": "ls -la /sys/kernel/debug", "section": "debug", "title": "Debug Filesystem Contents"},
-      {"cmd": "find /sys/kernel/debug/pinctrl -type f", "section": "debug", "title": "Pinctrl Debug Files"},
-      {"cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins", "section": "debug", "title": "Pinmux Configuration"},
-    ]
+    # Load commands from JSON file
+    self.os_type = None  # Will be determined after shell prompt detection
+    self.commands = []  # Will be loaded from JSON based on OS type
     self.collected_data = {}
+    
+    # Section mapping for markdown generation
+    self.section_mapping = {
+      "Operating System": "system",
+      "Board Hardware": "hardware",
+      "Storage": "storage",
+      "Network": "network",
+      "Kernel": "kernel",
+      "Debug": "debug",
+    }
 
   def setup_logging(self):
     """Setup logging with colored console and plain file"""
@@ -243,6 +231,110 @@ class BoardInfoCollector:
     
     return None
 
+  def detect_os_type(self) -> bool:
+    """Detect OS type (Android or Linux) by sending getprop command"""
+    self.logger.info("Detecting OS type (Android or Linux)...")
+    
+    # Send getprop command to check if Android
+    color = self.COLORS["SERIAL"]
+    reset = self.COLORS["RESET"]
+    self.logger.info(f"{color}[Serial]{reset} Sending: getprop | grep ro.build.fingerprint")
+    self.serial_conn.write(b"getprop | grep ro.build.fingerprint\r\n")
+    time.sleep(0.1)
+    
+    # Read response (wait up to 3 seconds)
+    output_buffer = ""
+    start_time = time.time()
+    timeout = 3.0
+    
+    while time.time() - start_time < timeout:
+      if self.serial_conn.in_waiting > 0:
+        data = self.serial_conn.read(self.serial_conn.in_waiting).decode("utf-8", errors="ignore")
+        output_buffer += data
+        # Check if we got a "command not found" error (Linux)
+        if "command not found" in output_buffer.lower() or "sh:" in output_buffer or "not found" in output_buffer.lower():
+          self.logger.info("Linux detected (getprop command not found)")
+          self.os_type = "linux"
+          return True
+        # Check if we got a valid fingerprint response (Android)
+        # Android output format: [ro.build.fingerprint]: [value]
+        if ("[ro.build.fingerprint]" in output_buffer or "ro.build.fingerprint:" in output_buffer) and "command not found" not in output_buffer.lower():
+          self.logger.info("Android detected (getprop response received)")
+          self.os_type = "android"
+          return True
+      time.sleep(0.1)
+    
+    # No clear response, check if output contains fingerprint pattern without error
+    if "ro.build.fingerprint" in output_buffer and "command not found" not in output_buffer.lower() and "not found" not in output_buffer.lower():
+      self.logger.info("Android detected (fingerprint pattern found in output)")
+      self.os_type = "android"
+      return True
+    
+    # No Android response, assume Linux
+    self.logger.info("Linux detected (no getprop response or command not found)")
+    self.os_type = "linux"
+    return True
+  
+  def load_commands_from_json(self) -> bool:
+    """Load commands from info_commands.json based on OS type"""
+    json_path = Path("info_commands.json")
+    if not json_path.exists():
+      self.logger.error(f"info_commands.json not found at {json_path.absolute()}")
+      return False
+    
+    try:
+      with open(json_path, "r") as f:
+        commands_data = json.load(f)
+      
+      if self.os_type not in commands_data:
+        self.logger.error(f"OS type '{self.os_type}' not found in info_commands.json")
+        return False
+      
+      # Flatten commands from JSON structure
+      self.commands = []
+      for section_name, commands in commands_data[self.os_type].items():
+        for cmd_info in commands:
+          self.commands.append({
+            "cmd": cmd_info["cmd"],
+            "section": self.section_mapping.get(section_name, section_name.lower().replace(" ", "_")),
+            "title": cmd_info["title"],
+            "section_name": section_name,  # Keep original section name for markdown
+          })
+      
+      self.logger.info(f"Loaded {len(self.commands)} commands for {self.os_type} OS")
+      return True
+    except Exception as e:
+      self.logger.error(f"Failed to load commands from JSON: {e}")
+      return False
+  
+  def send_su_command(self) -> bool:
+    """Send 'su' command for Android root access"""
+    self.logger.info("Sending 'su' command for Android root access...")
+    color = self.COLORS["SERIAL"]
+    reset = self.COLORS["RESET"]
+    self.logger.info(f"{color}[Serial]{reset} Sending: su")
+    self.serial_conn.write(b"su\r\n")
+    time.sleep(1.0)  # Wait for su to complete
+    
+    # Read any response (su might prompt or just switch to root)
+    output_buffer = ""
+    start_time = time.time()
+    timeout = 2.0
+    
+    while time.time() - start_time < timeout:
+      if self.serial_conn.in_waiting > 0:
+        data = self.serial_conn.read(self.serial_conn.in_waiting).decode("utf-8", errors="ignore")
+        output_buffer += data
+      time.sleep(0.1)
+    
+    # Check if we got root prompt (usually # instead of $)
+    if "#" in output_buffer or "root" in output_buffer.lower():
+      self.logger.info("Root access obtained")
+      return True
+    else:
+      self.logger.warning("su command sent, but root access not confirmed")
+      return True  # Continue anyway
+
   def collect_command_output(self, command: Dict[str, str]) -> str:
     """Collect output for a single command - simple buffer-based approach: read everything until shell prompt"""
     cmd = command["cmd"]
@@ -262,8 +354,8 @@ class BoardInfoCollector:
     time.sleep(0.05)
     
     # Read everything until shell prompt appears - simple buffer-based approach (like pinmux_get.py)
-    # Use same regex pattern as pinmux_get.py for consistency
-    shell_prompt_pattern = re.compile(r"root@.*?:\~#\s*$")
+    # Use same regex pattern as PATTERNS for consistency (supports both Linux and Android)
+    shell_prompt_pattern = self.PATTERNS["shell_prompt"]
     output_buffer = ""
     start_time = time.time()
     timeout = 60.0  # Max 60 seconds per command
@@ -413,7 +505,32 @@ class BoardInfoCollector:
         self.logger.error(f"Unexpected prompt: {prompt}. Expected shell_prompt.")
         return False
       
-      self.logger.info("Shell prompt detected, starting command collection")
+      self.logger.info("Shell prompt detected, disabling kernel messages...")
+      
+      # Disable kernel messages first
+      # Use echo to /proc/sys/kernel/printk (works on both Linux and Android with root)
+      self.send_command('echo "0 0 0 0" > /proc/sys/kernel/printk 2>/dev/null', send_ctrl_c=False)
+      time.sleep(0.2)
+      self.logger.info("Disabled kernel messages (printk)")
+      
+      self.logger.info("Detecting OS type...")
+      
+      # Detect OS type (Android or Linux)
+      if not self.detect_os_type():
+        self.logger.error("Failed to detect OS type")
+        return False
+      
+      # Load commands from JSON based on OS type
+      if not self.load_commands_from_json():
+        self.logger.error("Failed to load commands from JSON")
+        return False
+      
+      # If Android, send 'su' command for root access
+      if self.os_type == "android":
+        if not self.send_su_command():
+          self.logger.warning("su command failed, but continuing...")
+      
+      self.logger.info(f"Starting command collection for {self.os_type} OS")
       
       # Collect all commands
       for cmd_info in self.commands:
@@ -421,6 +538,7 @@ class BoardInfoCollector:
         self.collected_data[cmd_info["title"]] = {
           "command": cmd_info["cmd"],
           "section": cmd_info["section"],
+          "section_name": cmd_info.get("section_name", cmd_info["section"]),
           "output": output,
         }
       
@@ -450,14 +568,14 @@ class BoardInfoCollector:
 
   def generate_markdown(self):
     """Generate markdown file with collected data"""
+    # Organize by section_name (from JSON)
     sections = {}
     
-    # Organize by section
     for title, data in self.collected_data.items():
-      section = data["section"]
-      if section not in sections:
-        sections[section] = []
-      sections[section].append((title, data))
+      section_name = data.get("section_name", data["section"])
+      if section_name not in sections:
+        sections[section_name] = []
+      sections[section_name].append((title, data))
     
     # Generate markdown
     md_lines = ["# Board Information\n"]
@@ -466,6 +584,7 @@ class BoardInfoCollector:
     current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     md_lines.append("---\n")
     md_lines.append(f"**Serial Port:** {self.serial_port}\n")
+    md_lines.append(f"**OS Type:** {self.os_type.capitalize() if self.os_type else 'Unknown'}\n")
     md_lines.append(f"**Date:** {current_datetime}\n")
     md_lines.append(f"**Script Version:** {self.VERSION}\n")
     md_lines.append("---\n")
@@ -473,32 +592,24 @@ class BoardInfoCollector:
     
     # Table of Contents (with clickable links)
     md_lines.append("## Table of Contents\n")
-    section_order = ["system", "hardware", "storage", "network", "kernel", "debug"]
-    section_titles = {
-      "system": "Operating System",
-      "hardware": "Board Hardware",
-      "storage": "Storage",
-      "network": "Network",
-      "kernel": "Kernel",
-      "debug": "Debug",
-    }
-    for section in section_order:
-      if section in sections:
+    section_order = ["Operating System", "Board Hardware", "Storage", "Network", "Kernel", "Debug"]
+    for section_name in section_order:
+      if section_name in sections:
         # Create anchor link for PDF navigation
-        anchor = section.replace("_", "-")
-        md_lines.append(f"- [{section_titles.get(section, section.capitalize())}](#{anchor}-information)")
+        anchor = section_name.lower().replace(" ", "-")
+        md_lines.append(f"- [{section_name}](#{anchor}-information)")
     md_lines.append("\n")
     
     # Content by section
-    for section in section_order:
-      if section not in sections:
+    for section_name in section_order:
+      if section_name not in sections:
         continue
       
       # Add anchor for TOC links
-      anchor = section.replace("_", "-")
-      md_lines.append(f"## {section_titles.get(section, section.capitalize())} Information {{#{anchor}-information}}\n")
+      anchor = section_name.lower().replace(" ", "-")
+      md_lines.append(f"## {section_name} Information {{#{anchor}-information}}\n")
       
-      for title, data in sections[section]:
+      for title, data in sections[section_name]:
         md_lines.append(f"### {title}\n")
         # Command is already clean (no || echo parts in self.commands)
         md_lines.append(f"**Command:** `{data['command']}`\n")

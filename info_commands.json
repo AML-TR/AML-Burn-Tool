@@ -1,0 +1,179 @@
+{
+  "android": {
+    "Operating System": [
+      {
+        "cmd": "getprop ro.build.fingerprint",
+        "title": "Build Fingerprint"
+      },
+      {
+        "cmd": "getprop ro.build.version.release",
+        "title": "Android Version"
+      },
+      {
+        "cmd": "getprop ro.build.version.sdk",
+        "title": "SDK Version"
+      },
+      {
+        "cmd": "getprop ro.product.model",
+        "title": "Product Model"
+      },
+      {
+        "cmd": "getprop ro.product.manufacturer",
+        "title": "Manufacturer"
+      },
+      {
+        "cmd": "getprop ro.product.device",
+        "title": "Device Name"
+      },
+      {
+        "cmd": "hostname",
+        "title": "Hostname"
+      }
+    ],
+    "Board Hardware": [
+      {
+        "cmd": "cat /proc/cpuinfo",
+        "title": "CPU Information"
+      },
+      {
+        "cmd": "cat /proc/meminfo",
+        "title": "Memory Information"
+      }
+    ],
+    "Storage": [
+      {
+        "cmd": "df -h",
+        "title": "Filesystem Usage"
+      },
+      {
+        "cmd": "mount",
+        "title": "Mounted Filesystems"
+      },
+      {
+        "cmd": "fdisk -l",
+        "title": "Partition Table"
+      }
+    ],
+    "Network": [
+      {
+        "cmd": "ip a",
+        "title": "Network Interfaces"
+      },
+      {
+        "cmd": "ifconfig",
+        "title": "Network Interfaces (ifconfig)"
+      }
+    ],
+    "Kernel": [
+      {
+        "cmd": "uname -a",
+        "title": "Kernel Information"
+      },
+      {
+        "cmd": "cat /proc/version",
+        "title": "Kernel Version"
+      },
+      {
+        "cmd": "lsmod",
+        "title": "Loaded Kernel Modules"
+      },
+      {
+        "cmd": "find /proc/device-tree/",
+        "title": "Device Tree"
+      }
+    ],
+    "Debug": [
+      {
+        "cmd": "ls -la /sys/kernel/debug",
+        "title": "Debug Filesystem Contents"
+      },
+      {
+        "cmd": "find /sys/kernel/debug/pinctrl -type f",
+        "title": "Pinctrl Debug Files"
+      },
+      {
+        "cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins",
+        "title": "Pinmux Configuration"
+      }
+    ]
+  },
+  "linux": {
+    "Operating System": [
+      {
+        "cmd": "cat /etc/os-release",
+        "title": "OS Release Information"
+      },
+      {
+        "cmd": "cat /etc/version",
+        "title": "Version Information"
+      },
+      {
+        "cmd": "hostname",
+        "title": "Hostname"
+      }
+    ],
+    "Board Hardware": [
+      {
+        "cmd": "cat /proc/cpuinfo",
+        "title": "CPU Information"
+      },
+      {
+        "cmd": "cat /proc/meminfo",
+        "title": "Memory Information"
+      }
+    ],
+    "Storage": [
+      {
+        "cmd": "df -h",
+        "title": "Filesystem Usage"
+      },
+      {
+        "cmd": "mount",
+        "title": "Mounted Filesystems"
+      },
+      {
+        "cmd": "fdisk -l",
+        "title": "Partition Table"
+      }
+    ],
+    "Network": [
+      {
+        "cmd": "ip a",
+        "title": "Network Interfaces"
+      }
+    ],
+    "Kernel": [
+      {
+        "cmd": "uname -a",
+        "title": "Kernel Information"
+      },
+      {
+        "cmd": "lsmod",
+        "title": "Loaded Kernel Modules"
+      },
+      {
+        "cmd": "zcat /proc/config.gz",
+        "title": "Kernel Configuration"
+      },
+      {
+        "cmd": "find /proc/device-tree/",
+        "title": "Device Tree"
+      }
+    ],
+    "Debug": [
+      {
+        "cmd": "ls -la /sys/kernel/debug",
+        "title": "Debug Filesystem Contents"
+      },
+      {
+        "cmd": "find /sys/kernel/debug/pinctrl -type f",
+        "title": "Pinctrl Debug Files"
+      },
+      {
+        "cmd": "cat /sys/kernel/debug/pinctrl/*/pinmux-pins",
+        "title": "Pinmux Configuration"
+      }
+    ]
+  }
+}
+
